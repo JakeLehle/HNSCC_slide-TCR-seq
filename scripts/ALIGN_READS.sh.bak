@@ -1,0 +1,744 @@
+#!/bin/bash
+
+#SBATCH -J ALIGN_SLIDE-TCR-SEQ                                              # Job name
+#SBATCH -o /work/sdz852/WORKING/LOGS/ALIGN_SPATIAL.o.log              # Name of the stdout output file
+#SBATCH -e /work/sdz852/WORKING/LOGS/ALIGN_SPATIAL.e.log              # Name of the stderr error file
+#SBATCH --mail-user=jake.lehle@utsa.edu                                  # Send me an email when you are done
+#SBATCH --mail-type=ALL
+#SBATCH -t 10-00:00:00                                                   # Time of job
+#SBATCH -p compute2                                              # Queue (partition) name
+#SBATCH -N 1                                                     # Total # of nodes (must be 1 for serial)
+#SBATCH -n 1                                                     # Total # of mpi tasks (should be 1 for serial)
+#SBATCH -c 80                                                    # Total number of cores 80 max
+
+# Startup scripts
+
+module load anaconda3
+conda activate slide-TCR-seq
+
+#===============================================================================
+# CONVERT SLIDE-SEQ BEAD BARCODES TO STAR-COMPATIBLE FORMAT
+#
+# Sophia's BeadBarcodes.txt files are comma-separated:
+#   T,G,C,G,T,G,C,G,A,G,A,G,T,N
+#
+# STAR requires continuous strings:
+#   TGCGTGCGAGAGTN
+#
+# This section converts all whitelist files and prepares them for STARsolo.
+#===============================================================================
+
+set -o pipefail
+
+# Configuration
+FASTQ_BASE="/work/sdz852/WORKING/slide-TCR-seq/fastq"
+OUTPUT_DIR="/work/sdz852/WORKING/slide-TCR-seq/working/whitelists"
+
+mkdir -p "${OUTPUT_DIR}"
+
+echo "=============================================="
+echo "CONVERTING BEAD BARCODE WHITELISTS"
+echo "=============================================="
+
+# First, let's examine the actual file format
+echo ""
+echo "Examining original whitelist format..."
+SAMPLE_FILE="${FASTQ_BASE}/2022-01-28_Puck_211214_40/barcode_matching/BeadBarcodes.txt"
+
+echo "First 5 lines of original file:"
+head -5 "${SAMPLE_FILE}"
+
+echo ""
+echo "File stats:"
+echo "  Total lines: $(wc -l < "${SAMPLE_FILE}")"
+echo "  First line length: $(head -1 "${SAMPLE_FILE}" | wc -c) characters"
+
+# Check if file has Windows line endings
+if file "${SAMPLE_FILE}" | grep -q "CRLF"; then
+    echo "  Line endings: Windows (CRLF)"
+else
+    echo "  Line endings: Unix (LF)"
+fi
+
+echo ""
+echo "=============================================="
+
+convert_whitelist() {
+    local INPUT_FILE=$1
+    local OUTPUT_FILE=$2
+    local SAMPLE_NAME=$3
+    
+    echo ""
+    echo "Processing: ${SAMPLE_NAME}"
+    echo "  Input:  ${INPUT_FILE}"
+    echo "  Output: ${OUTPUT_FILE}"
+    
+    # Method: Remove commas from each line, preserving line structure
+    # Also handle potential Windows line endings (CRLF -> LF)
+    # And filter out any empty lines or lines with only N's
+    
+    cat "${INPUT_FILE}" | \
+        tr -d '\r' | \
+        sed 's/,//g' | \
+        grep -v '^$' | \
+        grep -v '^N*$' > "${OUTPUT_FILE}"
+    
+    # Verify the conversion
+    local INPUT_LINES=$(wc -l < "${INPUT_FILE}")
+    local OUTPUT_LINES=$(wc -l < "${OUTPUT_FILE}")
+    local BC_LENGTH=$(head -1 "${OUTPUT_FILE}" | tr -d '\n' | wc -c)
+    
+    echo "  Input lines: ${INPUT_LINES}"
+    echo "  Output barcodes: ${OUTPUT_LINES}"
+    echo "  Barcode length: ${BC_LENGTH} bp"
+    
+    # Show first few converted barcodes
+    echo "  First 5 converted barcodes:"
+    head -5 "${OUTPUT_FILE}" | sed 's/^/    /'
+    
+    # Sanity check
+    if [ ${BC_LENGTH} -lt 10 ] || [ ${BC_LENGTH} -gt 30 ]; then
+        echo "  WARNING: Barcode length (${BC_LENGTH}) seems unusual!"
+    fi
+    
+    if [ ${OUTPUT_LINES} -lt 1000 ]; then
+        echo "  WARNING: Very few barcodes (${OUTPUT_LINES})!"
+    fi
+}
+
+# Convert each puck's whitelist
+for PUCK in 29 37 40; do
+    PUCK_DIR="${FASTQ_BASE}/2022-01-28_Puck_211214_${PUCK}/barcode_matching"
+    INPUT_FILE="${PUCK_DIR}/BeadBarcodes.txt"
+    OUTPUT_FILE="${OUTPUT_DIR}/BeadBarcodes_Puck_211214_${PUCK}.txt"
+    
+    if [ -f "${INPUT_FILE}" ]; then
+        convert_whitelist "${INPUT_FILE}" "${OUTPUT_FILE}" "Puck_211214_${PUCK}"
+    else
+        echo "WARNING: Input file not found: ${INPUT_FILE}"
+    fi
+done
+
+echo ""
+echo "=============================================="
+echo "CONVERSION COMPLETE"
+echo "=============================================="
+echo ""
+echo "Converted whitelists:"
+ls -la "${OUTPUT_DIR}/"
+echo ""
+echo "Summary of converted files:"
+for f in "${OUTPUT_DIR}"/*.txt; do
+    lines=$(wc -l < "$f")
+    bc_len=$(head -1 "$f" | tr -d '\n' | wc -c)
+    echo "  $(basename $f): ${lines} barcodes, ${bc_len}bp each"
+done
+
+#===============================================================================
+# SIMPLIFIED SLIDE-SEQ ALIGNMENT PIPELINE USING STARsolo
+#
+# This is a streamlined version that uses STARsolo for alignment,
+# which handles barcode extraction and UMI counting internally.
+#
+# Author: Jake Lehle
+# Project: HPV+ HNSCC Spatial Transcriptomics
+#===============================================================================
+
+#===============================================================================
+# SYSTEM RESOURCE SETTINGS
+#===============================================================================
+
+# Increase the maximum number of open file handles
+# STAR with many threads/sorting bins can exceed default limits
+# Try to set to 65535, fall back gracefully if not permitted
+CURRENT_ULIMIT=$(ulimit -n)
+TARGET_ULIMIT=65535
+
+if [ "$CURRENT_ULIMIT" -lt "$TARGET_ULIMIT" ]; then
+    ulimit -n $TARGET_ULIMIT 2>/dev/null
+    NEW_ULIMIT=$(ulimit -n)
+    if [ "$NEW_ULIMIT" -ge "$TARGET_ULIMIT" ]; then
+        echo "Increased file handle limit: $CURRENT_ULIMIT -> $NEW_ULIMIT"
+    else
+        echo "Warning: Could not increase ulimit to $TARGET_ULIMIT (current: $NEW_ULIMIT)"
+    fi
+else
+    echo "File handle limit sufficient: $CURRENT_ULIMIT"
+fi
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+
+# Directories
+WORKING_DIR="/work/sdz852/WORKING/slide-TCR-seq/working"
+FASTQ_BASE="/work/sdz852/WORKING/slide-TCR-seq/fastq"
+STAR_REF="/work/sdz852/WORKING/slide-TCR-seq/ref/GRCh38/star"
+BCL_DIR="${FASTQ_BASE}/220116_NB501164_1345_AHLGH2BGXK"
+WHITELIST_DIR="${WORKING_DIR}/whitelists"
+
+# Barcode structure (from Sophia's Drop-seq tools processing)
+# Read 1 structure: [14bp barcode][8bp UMI][remaining bases ignored]
+CB_LEN=14
+UMI_START=15
+UMI_LEN=8
+
+# Processing parameters
+CURRENT_ULIMIT=$(ulimit -n)
+if [ "$CURRENT_ULIMIT" -ge 65535 ]; then
+    THREADS=$(nproc)
+    BAM_SORT_BINS=200
+    echo "Using high-performance settings (THREADS=$THREADS, BAM_SORT_BINS=$BAM_SORT_BINS)"
+else
+    THREADS=16
+    BAM_SORT_BINS=50
+    echo "Using conservative settings (THREADS=$THREADS, BAM_SORT_BINS=$BAM_SORT_BINS)"
+fi
+
+# Sample info
+SAMPLES=("Puck_211214_29" "Puck_211214_37" "Puck_211214_40")
+SAMPLE_BARCODES=("AGATTTAA" "GGCGTCGA" "ATCACTCG")
+
+#===============================================================================
+# SETUP
+#===============================================================================
+
+mkdir -p "${WORKING_DIR}/logs"
+mkdir -p "${WORKING_DIR}/fastq"
+mkdir -p "${WORKING_DIR}/aligned"
+mkdir -p "${WORKING_DIR}/dge"
+mkdir -p "${WORKING_DIR}/checkpoints"
+mkdir -p "${WHITELIST_DIR}"
+
+for sample in "${SAMPLES[@]}"; do
+    mkdir -p "${WORKING_DIR}/aligned/${sample}"
+    mkdir -p "${WORKING_DIR}/dge/${sample}"
+done
+
+#===============================================================================
+# LOGGING
+#===============================================================================
+
+LOG_FILE="${WORKING_DIR}/logs/pipeline_v4_$(date +%Y%m%d_%H%M%S).log"
+
+log() {
+    local level=$1
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $@" | tee -a "${LOG_FILE}"
+}
+
+log_info() { log "INFO" "$@"; }
+log_warn() { log "WARN" "$@"; }
+log_error() { log "ERROR" "$@"; }
+log_success() { log "SUCCESS" "$@"; }
+
+section_header() {
+    echo "" | tee -a "${LOG_FILE}"
+    echo "========================================" | tee -a "${LOG_FILE}"
+    echo "$1" | tee -a "${LOG_FILE}"
+    echo "========================================" | tee -a "${LOG_FILE}"
+}
+
+#===============================================================================
+# CHECKPOINT FUNCTIONS
+#===============================================================================
+
+CHECKPOINT_DIR="${WORKING_DIR}/checkpoints"
+
+set_checkpoint() {
+    touch "${CHECKPOINT_DIR}/${1}.done"
+    log_info "Checkpoint set: ${1}"
+}
+
+check_checkpoint() {
+    [ -f "${CHECKPOINT_DIR}/${1}.done" ]
+}
+
+clear_all_checkpoints() {
+    rm -f "${CHECKPOINT_DIR}"/*.done
+    log_info "All checkpoints cleared"
+}
+
+#===============================================================================
+# STEP 0: CONVERT WHITELISTS
+#===============================================================================
+
+step0_convert_whitelists() {
+    section_header "STEP 0: CONVERT BEAD BARCODE WHITELISTS"
+    
+    if check_checkpoint "step0_whitelists"; then
+        log_info "Whitelists already converted, skipping..."
+        return 0
+    fi
+    
+    for i in "${!SAMPLES[@]}"; do
+        SAMPLE="${SAMPLES[$i]}"
+        PUCK_NUM="${SAMPLE##*_}"  # Extract number (29, 37, 40)
+        
+        INPUT_FILE="${FASTQ_BASE}/2022-01-28_${SAMPLE}/barcode_matching/BeadBarcodes.txt"
+        OUTPUT_FILE="${WHITELIST_DIR}/BeadBarcodes_${SAMPLE}.txt"
+        
+        if [ ! -f "${INPUT_FILE}" ]; then
+            log_error "Whitelist not found: ${INPUT_FILE}"
+            return 1
+        fi
+        
+        log_info "Converting whitelist for ${SAMPLE}..."
+        
+        # Convert comma-separated to continuous string
+        sed 's/,//g' "${INPUT_FILE}" > "${OUTPUT_FILE}"
+        
+        # Get stats
+        local NUM_BC=$(wc -l < "${OUTPUT_FILE}")
+        local BC_LENGTH=$(head -1 "${OUTPUT_FILE}" | tr -d '\n\r' | wc -c)
+        
+        log_info "  Barcodes: ${NUM_BC}, Length: ${BC_LENGTH}bp"
+        
+        # Verify barcode length matches expected
+        if [ "${BC_LENGTH}" -ne "${CB_LEN}" ]; then
+            log_warn "  Barcode length (${BC_LENGTH}) differs from expected (${CB_LEN})!"
+            log_warn "  Updating CB_LEN to ${BC_LENGTH}"
+        fi
+    done
+    
+    log_success "Whitelist conversion complete"
+    set_checkpoint "step0_whitelists"
+    return 0
+}
+
+#===============================================================================
+# STEP 1: BCL TO FASTQ
+#===============================================================================
+
+step1_bcl_to_fastq() {
+    section_header "STEP 1: BCL TO FASTQ CONVERSION"
+    
+    if check_checkpoint "step1_bcl2fastq"; then
+        log_info "Step 1 already completed, skipping..."
+        return 0
+    fi
+    
+    local fastq_count=$(ls ${WORKING_DIR}/fastq/Puck_*_R1_001.fastq.gz 2>/dev/null | wc -l)
+    if [ ${fastq_count} -ge 3 ]; then
+        log_info "FASTQ files already exist, skipping..."
+        set_checkpoint "step1_bcl2fastq"
+        return 0
+    fi
+    
+    cat > "${WORKING_DIR}/SampleSheet.csv" << 'EOF'
+[Header]
+IEMFileVersion,4
+Date,2022-01-16
+Workflow,GenerateFASTQ
+Application,NextSeq FASTQ Only
+
+[Reads]
+42
+50
+
+[Settings]
+CreateFastqForIndexReads,1
+MinimumTrimmedReadLength,0
+MaskShortAdapterReads,0
+
+[Data]
+Sample_ID,Sample_Name,index
+Puck_211214_29,Puck_211214_29,AGATTTAA
+Puck_211214_37,Puck_211214_37,GGCGTCGA
+Puck_211214_40,Puck_211214_40,ATCACTCG
+EOF
+
+    log_info "Running bcl2fastq..."
+    
+    bcl2fastq \
+        --runfolder-dir "${BCL_DIR}" \
+        --output-dir "${WORKING_DIR}/fastq" \
+        --sample-sheet "${WORKING_DIR}/SampleSheet.csv" \
+        --no-lane-splitting \
+        --processing-threads ${THREADS} \
+        --barcode-mismatches 1 \
+        2>&1 | tee -a "${LOG_FILE}"
+    
+    if [ $? -ne 0 ]; then
+        log_error "bcl2fastq failed"
+        return 1
+    fi
+    
+    log_success "BCL to FASTQ conversion complete"
+    set_checkpoint "step1_bcl2fastq"
+    return 0
+}
+
+#===============================================================================
+# STEP 2: STAR ALIGNMENT
+#===============================================================================
+
+step2_star_alignment() {
+    local SAMPLE=$1
+    
+    section_header "STEP 2: STAR ALIGNMENT - ${SAMPLE}"
+    
+    if check_checkpoint "step2_star_${SAMPLE}"; then
+        log_info "STAR alignment already completed, skipping..."
+        return 0
+    fi
+    
+    local OUT_DIR="${WORKING_DIR}/aligned/${SAMPLE}"
+    
+    # Check existing BAM
+    if [ -f "${OUT_DIR}/Aligned.sortedByCoord.out.bam" ] && [ -f "${OUT_DIR}/Aligned.sortedByCoord.out.bam.bai" ]; then
+        log_info "BAM file already exists, skipping..."
+        set_checkpoint "step2_star_${SAMPLE}"
+        return 0
+    fi
+    
+    # Find FASTQ files
+    local R1=$(ls ${WORKING_DIR}/fastq/${SAMPLE}_S*_R1_001.fastq.gz 2>/dev/null | head -1)
+    local R2=$(ls ${WORKING_DIR}/fastq/${SAMPLE}_S*_R2_001.fastq.gz 2>/dev/null | head -1)
+    
+    if [ -z "$R1" ] || [ -z "$R2" ]; then
+        log_error "FASTQ files not found for ${SAMPLE}"
+        return 1
+    fi
+    
+    log_info "R1: ${R1}"
+    log_info "R2: ${R2}"
+    
+    # Use converted whitelist
+    local WHITELIST="${WHITELIST_DIR}/BeadBarcodes_${SAMPLE}.txt"
+    
+    if [ ! -f "${WHITELIST}" ]; then
+        log_error "Converted whitelist not found: ${WHITELIST}"
+        log_error "Run step 0 first to convert whitelists"
+        return 1
+    fi
+    
+    local NUM_BC=$(wc -l < "${WHITELIST}")
+    log_info "Whitelist: ${WHITELIST} (${NUM_BC} barcodes)"
+    log_info "Barcode structure: ${CB_LEN}bp CB (pos 1-${CB_LEN}) + ${UMI_LEN}bp UMI (pos ${UMI_START}-$((UMI_START + UMI_LEN - 1)))"
+    
+    # Clean up partial runs
+    rm -rf "${OUT_DIR}"/_STARtmp 2>/dev/null
+    rm -f "${OUT_DIR}"/_STAR* 2>/dev/null
+    
+    log_info "Starting STAR alignment..."
+    log_info "This may take 1-2 hours..."
+    
+    # Run STAR with correct 14bp barcode + 8bp UMI structure
+    STAR \
+        --runThreadN ${THREADS} \
+        --genomeDir "${STAR_REF}" \
+        --readFilesIn "${R2}" "${R1}" \
+        --readFilesCommand zcat \
+        --outFileNamePrefix "${OUT_DIR}/" \
+        --outSAMtype BAM SortedByCoordinate \
+        --outSAMattributes NH HI nM AS CR UR CB UB GX GN sS sQ sM \
+        --outBAMsortingBinsN ${BAM_SORT_BINS} \
+        --limitBAMsortRAM 60000000000 \
+        --soloType CB_UMI_Simple \
+        --soloCBwhitelist "${WHITELIST}" \
+        --soloCBstart 1 \
+        --soloCBlen ${CB_LEN} \
+        --soloUMIstart ${UMI_START} \
+        --soloUMIlen ${UMI_LEN} \
+        --soloBarcodeReadLength 0 \
+        --soloFeatures Gene GeneFull \
+        --soloUMIdedup 1MM_All \
+        --soloCellFilter EmptyDrops_CR \
+        --soloOutFileNames Solo.out/ genes.tsv barcodes.tsv matrix.mtx \
+        --outReadsUnmapped Fastx \
+        --outFilterScoreMinOverLread 0.3 \
+        --outFilterMatchNminOverLread 0.3 \
+        2>&1 | tee -a "${LOG_FILE}"
+    
+    local exit_code=$?
+    
+    if [ ${exit_code} -ne 0 ]; then
+        log_error "STAR failed with exit code ${exit_code}"
+        return 1
+    fi
+    
+    if [ ! -f "${OUT_DIR}/Aligned.sortedByCoord.out.bam" ]; then
+        log_error "BAM file not created"
+        return 1
+    fi
+    
+    log_info "Indexing BAM file..."
+    samtools index "${OUT_DIR}/Aligned.sortedByCoord.out.bam"
+    
+    log_info "Compressing unmapped reads..."
+    [ -f "${OUT_DIR}/Unmapped.out.mate1" ] && gzip -f "${OUT_DIR}/Unmapped.out.mate1"
+    [ -f "${OUT_DIR}/Unmapped.out.mate2" ] && gzip -f "${OUT_DIR}/Unmapped.out.mate2"
+    
+    log_success "STAR alignment complete for ${SAMPLE}"
+    set_checkpoint "step2_star_${SAMPLE}"
+    return 0
+}
+
+#===============================================================================
+# STEP 3: PREPARE ANNDATA INPUTS
+#===============================================================================
+
+step3_prepare_anndata() {
+    local SAMPLE=$1
+    
+    section_header "STEP 3: PREPARE ANNDATA INPUTS - ${SAMPLE}"
+    
+    if check_checkpoint "step3_anndata_${SAMPLE}"; then
+        log_info "AnnData preparation already completed, skipping..."
+        return 0
+    fi
+    
+    local OUT_DIR="${WORKING_DIR}/aligned/${SAMPLE}"
+    local DGE_DIR="${WORKING_DIR}/dge/${SAMPLE}"
+    local SOLO_DIR="${OUT_DIR}/Solo.out/Gene"
+    
+    if [ ! -d "${SOLO_DIR}" ]; then
+        log_error "STARsolo output not found: ${SOLO_DIR}"
+        return 1
+    fi
+    
+    # Find matrix directory
+    local MATRIX_DIR=""
+    if [ -d "${SOLO_DIR}/filtered" ] && [ -f "${SOLO_DIR}/filtered/matrix.mtx" ]; then
+        MATRIX_DIR="${SOLO_DIR}/filtered"
+        log_info "Using filtered matrix"
+    elif [ -d "${SOLO_DIR}/raw" ] && [ -f "${SOLO_DIR}/raw/matrix.mtx" ]; then
+        MATRIX_DIR="${SOLO_DIR}/raw"
+        log_info "Using raw matrix"
+    else
+        log_error "No matrix found in ${SOLO_DIR}"
+        return 1
+    fi
+    
+    log_info "Copying matrix files..."
+    
+    for file in matrix.mtx barcodes.tsv features.tsv genes.tsv; do
+        if [ -f "${MATRIX_DIR}/${file}" ]; then
+            cp "${MATRIX_DIR}/${file}" "${DGE_DIR}/"
+            gzip -f "${DGE_DIR}/${file}"
+            log_info "  ${file}"
+        fi
+    done
+    
+    # Ensure genes.tsv exists
+    if [ -f "${DGE_DIR}/features.tsv.gz" ] && [ ! -f "${DGE_DIR}/genes.tsv.gz" ]; then
+        cp "${DGE_DIR}/features.tsv.gz" "${DGE_DIR}/genes.tsv.gz"
+    fi
+    
+    # Copy spatial coordinates
+    local SOPHIA_DIR="${FASTQ_BASE}/2022-01-28_${SAMPLE}/barcode_matching"
+    for coord_file in "${SAMPLE}_barcode_matching.txt.gz" "${SAMPLE}_barcode_xy.txt.gz"; do
+        if [ -f "${SOPHIA_DIR}/${coord_file}" ]; then
+            cp "${SOPHIA_DIR}/${coord_file}" "${DGE_DIR}/"
+            log_info "  Copied: ${coord_file}"
+            break
+        fi
+    done
+    
+    log_success "AnnData inputs prepared for ${SAMPLE}"
+    set_checkpoint "step3_anndata_${SAMPLE}"
+    return 0
+}
+
+#===============================================================================
+# STEP 4: SUMMARY
+#===============================================================================
+
+step4_summary() {
+    section_header "PIPELINE SUMMARY"
+    
+    echo "" | tee -a "${LOG_FILE}"
+    echo "Barcode Parameters Used:" | tee -a "${LOG_FILE}"
+    echo "  Cell Barcode: ${CB_LEN}bp (positions 1-${CB_LEN})" | tee -a "${LOG_FILE}"
+    echo "  UMI: ${UMI_LEN}bp (positions ${UMI_START}-$((UMI_START + UMI_LEN - 1)))" | tee -a "${LOG_FILE}"
+    echo "" | tee -a "${LOG_FILE}"
+    
+    for SAMPLE in "${SAMPLES[@]}"; do
+        echo "=== ${SAMPLE} ===" | tee -a "${LOG_FILE}"
+        
+        local OUT_DIR="${WORKING_DIR}/aligned/${SAMPLE}"
+        local DGE_DIR="${WORKING_DIR}/dge/${SAMPLE}"
+        
+        if [ -f "${OUT_DIR}/Log.final.out" ]; then
+            echo "STAR Alignment:" | tee -a "${LOG_FILE}"
+            grep -E "Number of input reads|Uniquely mapped reads|% of reads mapped" \
+                "${OUT_DIR}/Log.final.out" | tee -a "${LOG_FILE}"
+        fi
+        
+        if [ -f "${OUT_DIR}/Solo.out/Gene/Summary.csv" ]; then
+            echo "" | tee -a "${LOG_FILE}"
+            echo "STARsolo Summary:" | tee -a "${LOG_FILE}"
+            cat "${OUT_DIR}/Solo.out/Gene/Summary.csv" | tee -a "${LOG_FILE}"
+        fi
+        
+        if [ -f "${DGE_DIR}/barcodes.tsv.gz" ]; then
+            local cell_count=$(zcat "${DGE_DIR}/barcodes.tsv.gz" | wc -l)
+            echo "" | tee -a "${LOG_FILE}"
+            echo "Cells in filtered matrix: ${cell_count}" | tee -a "${LOG_FILE}"
+        fi
+        
+        echo "" | tee -a "${LOG_FILE}"
+    done
+    
+    echo "========================================" | tee -a "${LOG_FILE}"
+    echo "Output Locations:" | tee -a "${LOG_FILE}"
+    echo "  Converted whitelists: ${WHITELIST_DIR}/" | tee -a "${LOG_FILE}"
+    echo "  FASTQ files: ${WORKING_DIR}/fastq/" | tee -a "${LOG_FILE}"
+    echo "  Aligned BAMs: ${WORKING_DIR}/aligned/{sample}/" | tee -a "${LOG_FILE}"
+    echo "  DGE matrices: ${WORKING_DIR}/dge/{sample}/" | tee -a "${LOG_FILE}"
+    echo "========================================" | tee -a "${LOG_FILE}"
+}
+
+#===============================================================================
+# VALIDATION
+#===============================================================================
+
+validate_inputs() {
+    section_header "VALIDATING INPUTS"
+    
+    local errors=0
+    
+    # Check STAR
+    if command -v STAR &> /dev/null; then
+        log_info "STAR: $(STAR --version)"
+    else
+        log_error "STAR not found"
+        ((errors++))
+    fi
+    
+    # Check STAR reference
+    if [ -f "${STAR_REF}/SA" ]; then
+        log_info "STAR reference: OK"
+    else
+        log_error "STAR reference not found: ${STAR_REF}"
+        ((errors++))
+    fi
+    
+    # Check original whitelists exist
+    for SAMPLE in "${SAMPLES[@]}"; do
+        local wl="${FASTQ_BASE}/2022-01-28_${SAMPLE}/barcode_matching/BeadBarcodes.txt"
+        if [ -f "${wl}" ]; then
+            log_info "Whitelist ${SAMPLE}: OK"
+        else
+            log_error "Whitelist not found: ${wl}"
+            ((errors++))
+        fi
+    done
+    
+    # Check samtools
+    if command -v samtools &> /dev/null; then
+        log_info "samtools: OK"
+    else
+        log_error "samtools not found"
+        ((errors++))
+    fi
+    
+    if [ ${errors} -gt 0 ]; then
+        log_error "Validation failed with ${errors} error(s)"
+        return 1
+    fi
+    
+    log_success "All inputs validated"
+    return 0
+}
+
+#===============================================================================
+# MAIN
+#===============================================================================
+
+main() {
+    section_header "SLIDE-SEQ ALIGNMENT PIPELINE v4"
+    
+    log_info "Started at $(date)"
+    log_info "Working directory: ${WORKING_DIR}"
+    log_info "Barcode structure: ${CB_LEN}bp CB + ${UMI_LEN}bp UMI"
+    
+    # Handle --clean flag
+    if [ "$1" == "--clean" ]; then
+        log_warn "Cleaning all checkpoints..."
+        clear_all_checkpoints
+    fi
+    
+    # Validate
+    if ! validate_inputs; then
+        exit 1
+    fi
+    
+    local success=true
+    
+    # Step 0: Convert whitelists
+    if ! step0_convert_whitelists; then
+        log_error "Step 0 failed"
+        success=false
+    fi
+    
+    # Step 1: BCL to FASTQ
+    if [ "$success" = true ] && ! step1_bcl_to_fastq; then
+        log_error "Step 1 failed"
+        success=false
+    fi
+    
+    # Steps 2-3: Process each sample
+    if [ "$success" = true ]; then
+        for i in "${!SAMPLES[@]}"; do
+            SAMPLE="${SAMPLES[$i]}"
+            log_info "Processing ${SAMPLE} ($((i+1))/${#SAMPLES[@]})"
+            
+            if ! step2_star_alignment "${SAMPLE}"; then
+                log_error "Step 2 failed for ${SAMPLE}"
+                success=false
+                continue
+            fi
+            
+            if ! step3_prepare_anndata "${SAMPLE}"; then
+                log_error "Step 3 failed for ${SAMPLE}"
+                success=false
+                continue
+            fi
+        done
+    fi
+    
+    # Summary
+    step4_summary
+    
+    section_header "PIPELINE COMPLETE"
+    
+    if [ "$success" = true ]; then
+        log_success "Pipeline completed successfully at $(date)"
+        exit 0
+    else
+        log_error "Pipeline completed with errors at $(date)"
+        exit 1
+    fi
+}
+
+# Help
+if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
+    cat << EOF
+Slide-seq Alignment Pipeline v4
+
+Processes Sophia Liu's Slide-TCR-seq data from raw BCL files.
+
+Usage: $(basename $0) [OPTIONS]
+
+Options:
+    --clean     Clear all checkpoints and start fresh
+    --help      Show this help message
+
+Key Parameters:
+    Cell Barcode: ${CB_LEN}bp (positions 1-${CB_LEN})
+    UMI: ${UMI_LEN}bp (positions ${UMI_START}-$((UMI_START + UMI_LEN - 1)))
+
+This pipeline:
+    1. Converts comma-separated whitelists to STAR format
+    2. Runs bcl2fastq for demultiplexing
+    3. Aligns with STARsolo using correct barcode structure
+    4. Prepares AnnData-compatible outputs
+
+EOF
+    exit 0
+fi
+
+main "$@"
+
