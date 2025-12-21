@@ -1,0 +1,51 @@
+name: slide-TCR-seq
+channels:
+  - bioconda
+  - conda-forge
+  - dranew
+dependencies:
+  - adjusttext
+  - anndata
+  - awscli
+  - bbknn
+  - bioconda::gseapy
+  - celltypist
+  - cellxgene-census
+  - cython
+  - dranew::bclfastq
+  - fa2
+  - faiss
+  - firefox
+  - geoparse
+  - goatools
+  - hvplot
+  - leidenalg
+  - louvain
+  - matplotlib-base
+  - mixcr
+  - numpy
+  - pandas
+  - parallel-fastq-dump
+  - plotly-orca
+  - pybiomart
+  - pygraphviz
+  - pynndescent
+  - pyqt
+  - pysradb
+  - python-igraph
+  - python-wget
+  - python=3.11
+  - qt
+  - samtools
+  - scanpy
+  - scikit-learn
+  - scipy
+  - scvi-tools
+  - seaborn
+  - spyder
+  - spyder-terminal
+  - squidpy
+  - star=2.7.11b
+  - sra-tools[version='>=3.0.0']
+  - umap-learn
+
