@@ -1,8 +1,8 @@
 #!/bin/bash
 
-#SBATCH -J ADATA_SPATIAL                                              # Job name
-#SBATCH -o /work/sdz852/WORKING/LOGS/ADATA_SPATIAL.o.log              # Name of the stdout output file
-#SBATCH -e /work/sdz852/WORKING/LOGS/ADATA_SPATIAL.e.log              # Name of the stderr error file
+#SBATCH -J ANNOTATE_SPATIAL                                              # Job name
+#SBATCH -o /work/sdz852/WORKING/LOGS/ANNOTATE_SPATIAL.o.log              # Name of the stdout output file
+#SBATCH -e /work/sdz852/WORKING/LOGS/ANNOTATE_SPATIAL.e.log              # Name of the stderr error file
 #SBATCH --mail-user=jake.lehle@utsa.edu                                  # Send me an email when you are done
 #SBATCH --mail-type=ALL
 #SBATCH -t 10-00:00:00                                                   # Time of job
@@ -16,7 +16,7 @@
 module load anaconda3
 
 conda activate slide-TCR-seq
- 
-conda run -n slide-TCR-seq python /work/sdz852/WORKING/slide-TCR-seq/scripts/ADATA_PREP.py
+
+conda run -n slide-TCR-seq python /work/sdz852/WORKING/slide-TCR-seq/scripts/ANNOTATE_ADATA.py
 
 exit
