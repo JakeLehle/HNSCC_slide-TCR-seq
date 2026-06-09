@@ -39,4 +39,4 @@ conda activate sc_pre
 
 SCRIPT_DIR="/master/jlehle/WORKING/slide-TCR-seq-working/scripts"
 
-python "${SCRIPT_DIR}/Step04_Cell_Type_Annotation.py"
+conda run -n sc_pre python "${SCRIPT_DIR}/Step04_Cell_Type_Annotation.py"

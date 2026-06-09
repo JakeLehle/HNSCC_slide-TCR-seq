@@ -1,62 +1,24 @@
 #!/usr/bin/env python3
 """
-Step04_Cell_Type_Annotation_v5.py
+Step04_Cell_Type_Annotation_v3.py
 
 Automated cell type annotation and clustering for QC'd Slide-seq data.
-Combined single-environment pipeline: popV + cell2location + Pearson
-embedding, all in the unified sc_pre env.
+Brings the spatial Step04 to parity with the stable ClusterCatcher
+scanpy_qc_annotation.py pipeline (Jake's roadmap for this step), while
+keeping the spatial-specific additions.
 
 Pipeline:
   1. Load merged QC h5ad (raw counts)
-  2. popV annotation (Tabula Sapiens, on raw counts)        [checkpointed]
-  3. Store raw counts in layers['counts'] (canonical source)
-  4. cell2location deconvolution                            [checkpointed]
-       4a. RegressionModel on HNSCC single-cell reference (cached signatures)
-       4b. Cell2location spatial mapping (cached per detection_alpha)
-       4c. per-bead argmax label (c2l_argmax) + abundances
-  5. Pearson-residual embedding (from raw counts) -> PCA/UMAP/Leiden
-       log1p-CPM written to X for plotting/DE ONLY (never enters the embedding)
-  6. BBKNN batch correction (puck_id)
-  7. Leiden clustering (corrected graph)
-  8. popV cluster-consensus annotation (final_annotation)
-  9. popV + cell2location reconciliation (consensus_annotation + agreement)
- 10. Visualization (popV / c2l / consensus / agreement UMAPs + proportions)
+  2. popV annotation (Tabula Sapiens, on raw counts before normalization)
+  3. Merge popV annotations back (WHITELIST of popv_* columns only)
+  4. Normalize (CPM + log1p), store raw counts in layer
+  5. HVG selection (batch-aware by puck_id)
+  6. PCA, neighbors, UMAP
+  7. BBKNN batch correction (puck_id)        <-- restored from ClusterCatcher
+  8. Leiden clustering (on the corrected graph)
+  9. Cluster-based consensus annotation (weighted scoring)
+ 10. Visualization (UMAP set + spatial + before/after batch + proportions)
  11. Save annotated h5ad (sanitized writes)
-
------------------------------------------------------------------------------
-CHANGELOG (v5)
------------------------------------------------------------------------------
-vs v4:
-  - cell2location deconvolution folded in (unified sc_pre env now hosts both
-    popV and cell2location, so no cross-env hand-off). Two-stage:
-    RegressionModel signatures from the HNSCC single-cell reference, then
-    Cell2location spatial mapping on the raw merged Slide-seq counts.
-  - Both heavy stages are CHECKPOINTED: popV reuses the existing
-    all_pucks_popv_annotated.h5ad if present; reference signatures cache to
-    c2l_reference_signatures.csv; spatial abundances cache per detection_alpha
-    (c2l_abundances_alpha{N}.csv). The alpha sweep reruns only stage 4b.
-  - NEW consensus_annotation: popV (popv_prediction) reconciled with
-    cell2location (c2l_argmax) via an editable LABEL_HARMONIZE map, plus a
-    consensus_agreement flag. A popv-vs-c2l crosstab is written to disk to
-    drive completing the map. final_annotation (popV cluster-consensus) is
-    kept unchanged for downstream compatibility (SComatic/neoantigen).
-  - Device-aware: accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'.
-
-  AUDIT (log-CPM vs Pearson, per Jake's question): the embedding is built
-  ONLY from layers['counts'] (raw) via Pearson residuals -> X_pca. neighbors
-  uses use_rep='X_pca', so X is never read by PCA/neighbors/UMAP/Leiden.
-  log1p-CPM is applied to X AFTER X_pca is set and serves gene plots/DE only.
-  See post_annotation_processing() for the explicit assertion + log line.
-
------------------------------------------------------------------------------
-CHANGELOG (v4)
------------------------------------------------------------------------------
-vs v3:
-  - Embedding normalization switched from CPM+log1p to analytic Pearson
-    residuals (sc.experimental.pp). The bake-off confirmed this collapses the
-    library-size "snake" (depth_umap_corr 0.83 -> 0.16). Residuals drive the
-    PCA/UMAP/Leiden ONLY; adata.X stays log-normalized for gene plotting and
-    .raw. BBKNN, the figure set, and the popV/whitelist logic are unchanged.
 
 -----------------------------------------------------------------------------
 CHANGELOG (v3)
@@ -112,55 +74,6 @@ except ImportError:
     RUN_BBKNN = True            # restore ClusterCatcher batch correction
     BBKNN_BATCH_KEY = 'puck_id'
     CLUSTER_AFTER_BBKNN = True  # cluster on the corrected graph (see CHANGELOG)
-
-# Pearson-residual embedding HVG count (validated in the normalization bake-off)
-N_PEARSON_HVG = 2000
-
-# ---- cell2location configuration ----------------------------------------
-# Reference = NMF-paper HNSCC single-cell object built earlier
-# (build_cell2location_reference.py): raw counts in X + layers['counts'],
-# obs['final_annotation'] (12 types), batch column 'subject id'.
-try:
-    from spatial_config import C2L_REFERENCE_PATH
-except ImportError:
-    C2L_REFERENCE_PATH = (
-        "/master/jlehle/WORKING/2026_NMF_PAPER/data/FIG_4/00_input/"
-        "reference_for_cell2location.h5ad"
-    )
-C2L_REF_BATCH_KEY = "subject_id"        # 'subject id' is renamed to this
-C2L_LABELS_KEY    = "final_annotation"  # reference cell-type column
-
-C2L_CFG = {
-    "n_cells_per_location": 1,   # near-single-cell Slide-seq beads
-    "detection_alpha":      20,  # high within-slide variability; try 200 too
-    "ref_epochs":           250,
-    "map_epochs":           30000,
-}
-
-# popV (Tabula Sapiens vocab) <-> cell2location (HNSCC ref vocab) harmonization.
-# Maps BOTH vocabularies onto a shared coarse label so the two annotators can
-# be compared. The cell2location side is seeded from the reference's 12 types.
-# The popV side is INTENTIONALLY INCOMPLETE: review the popv-vs-c2l crosstab
-# written by build_consensus_annotation(), then fill in the popV strings.
-LABEL_HARMONIZE = {
-    # ---- cell2location reference labels (final_annotation) -> shared ----
-    "basal cell":   "epithelial",
-    "CD4 T":        "CD4_T",
-    "CD8 T":        "CD8_T",
-    "Treg":         "Treg",
-    "B":            "B",
-    "macrophage":   "macrophage",
-    "fibroblast":   "fibroblast",
-    "endothelial":  "endothelial",
-    "smooth muscle":"smooth_muscle",
-    "pDC":          "pDC",
-    "mast":         "mast",
-    "mDC":          "mDC",
-    # ---- popV labels (Tabula Sapiens) -> shared  [FILL IN FROM CROSSTAB] ----
-    # e.g. "cd4-positive, alpha-beta t cell": "CD4_T",
-    #      "cd8-positive, alpha-beta t cell": "CD8_T",
-    #      "b cell": "B", "macrophage": "macrophage", ...
-}
 
 import matplotlib
 matplotlib.use('Agg')
@@ -327,162 +240,6 @@ def run_popv_annotation(adata, cache_dir):
 
 
 # =========================================================================
-# CELL2LOCATION DECONVOLUTION
-# =========================================================================
-
-def _c2l_accelerator():
-    """Return 'gpu' if a CUDA device is visible, else 'cpu' (with a warning)."""
-    import torch
-    if torch.cuda.is_available():
-        return "gpu"
-    log("  WARNING: no CUDA device visible to torch. cell2location training "
-        "on CPU is extremely slow (hours-to-days); resolve the GPU first.")
-    return "cpu"
-
-
-def get_reference_signatures(out_dir, accelerator):
-    """
-    Stage 4a: per-cell-type expression signatures from the HNSCC single-cell
-    reference (cached to CSV; trained only once).
-    """
-    sig_path = os.path.join(out_dir, "c2l_reference_signatures.csv")
-    if os.path.exists(sig_path):
-        log(f"  [cache] reference signatures: {sig_path}")
-        return pd.read_csv(sig_path, index_col=0)
-
-    from cell2location.models import RegressionModel
-    from cell2location.utils.filtering import filter_genes
-
-    log(f"  Loading reference: {C2L_REFERENCE_PATH}")
-    ref = sc.read_h5ad(C2L_REFERENCE_PATH)
-
-    # 'subject id' (with a space) -> 'subject_id'
-    if 'subject id' in ref.obs.columns and C2L_REF_BATCH_KEY not in ref.obs.columns:
-        ref.obs = ref.obs.rename(columns={'subject id': C2L_REF_BATCH_KEY})
-    # raw integer counts in X
-    if 'counts' in ref.layers:
-        ref.X = ref.layers['counts'].copy()
-    assert C2L_LABELS_KEY in ref.obs.columns, \
-        f"reference missing labels column '{C2L_LABELS_KEY}'"
-    assert C2L_REF_BATCH_KEY in ref.obs.columns, \
-        f"reference missing batch column '{C2L_REF_BATCH_KEY}'"
-
-    # cell2location-recommended permissive gene filter
-    selected = filter_genes(
-        ref, cell_count_cutoff=5, cell_percentage_cutoff2=0.03,
-        nonz_mean_cutoff=1.12,
-    )
-    ref = ref[:, selected].copy()
-    log(f"    reference after gene filter: {ref.n_obs:,} x {ref.n_vars:,}")
-
-    RegressionModel.setup_anndata(
-        adata=ref, batch_key=C2L_REF_BATCH_KEY, labels_key=C2L_LABELS_KEY,
-    )
-    mod = RegressionModel(ref)
-    log(f"    training RegressionModel (max_epochs={C2L_CFG['ref_epochs']}, "
-        f"accelerator={accelerator})...")
-    # NOTE (version-sensitive): scvi-tools 1.4 uses accelerator=; older used
-    # use_gpu=. If this errors on the device kwarg, that is the line to adjust.
-    mod.train(max_epochs=C2L_CFG['ref_epochs'], accelerator=accelerator)
-    ref = mod.export_posterior(
-        ref, sample_kwargs={'num_samples': 1000, 'batch_size': 2500},
-    )
-
-    # canonical signature extraction (cell2location tutorial)
-    factor_names = ref.uns['mod']['factor_names']
-    cols = [f'means_per_cluster_mu_fg_{i}' for i in factor_names]
-    if 'means_per_cluster_mu_fg' in ref.varm.keys():
-        inf_aver = ref.varm['means_per_cluster_mu_fg'][cols].copy()
-    else:
-        inf_aver = ref.var[cols].copy()
-    inf_aver.columns = factor_names
-    inf_aver.to_csv(sig_path)
-    log(f"    saved signatures: {sig_path} "
-        f"({inf_aver.shape[0]} genes x {inf_aver.shape[1]} cell types)")
-    return inf_aver
-
-
-def run_cell2location(adata, out_dir):
-    """
-    Stage 4: cell2location deconvolution of the spatial beads.
-
-    Reads RAW counts from adata.layers['counts'] (set in main, before any
-    normalization). Writes per-bead abundances + argmax label to adata.obs.
-    The spatial mapping is cached per detection_alpha so the hyperparameter
-    sweep does not retrain the reference or rerun popV.
-    """
-    banner("CELL2LOCATION DECONVOLUTION")
-    import cell2location
-    from cell2location.models import Cell2location
-
-    accelerator = _c2l_accelerator()
-    inf_aver = get_reference_signatures(out_dir, accelerator)
-
-    alpha = C2L_CFG['detection_alpha']
-    abund_path = os.path.join(out_dir, f"c2l_abundances_alpha{alpha}.csv")
-
-    if os.path.exists(abund_path):
-        log(f"  [cache] spatial abundances: {abund_path}")
-        abund = pd.read_csv(abund_path, index_col=0)
-    else:
-        assert 'counts' in adata.layers, \
-            "layers['counts'] (raw) required before cell2location"
-        sp = ad.AnnData(
-            X=adata.layers['counts'].copy(),
-            obs=adata.obs.copy(),
-            var=adata.var.copy(),
-        )
-        # genes shared between spatial and reference signatures
-        shared = [g for g in sp.var_names if g in set(inf_aver.index)]
-        log(f"  genes shared with reference signatures: {len(shared):,}")
-        if len(shared) < 200:
-            raise RuntimeError(
-                f"Only {len(shared)} genes shared between spatial var_names and "
-                f"the reference signatures. This usually means the popV "
-                f"checkpoint kept Ensembl IDs while the reference uses HUGO "
-                f"symbols. Confirm adata.var_names are symbols (e.g. 'CD14'), "
-                f"not 'ENSG...'; if Ensembl, delete the popV checkpoint to "
-                f"force a fresh run with var_name restoration, or remap here."
-            )
-        sp = sp[:, shared].copy()
-        inf_use = inf_aver.loc[shared].copy()
-
-        Cell2location.setup_anndata(adata=sp, batch_key='puck_id')
-        mod = Cell2location(
-            sp, cell_state_df=inf_use,
-            N_cells_per_location=C2L_CFG['n_cells_per_location'],
-            detection_alpha=alpha,
-        )
-        log(f"  training Cell2location (alpha={alpha}, "
-            f"N_cells={C2L_CFG['n_cells_per_location']}, "
-            f"max_epochs={C2L_CFG['map_epochs']}, accelerator={accelerator})...")
-        mod.train(max_epochs=C2L_CFG['map_epochs'],
-                  batch_size=None, train_size=1, accelerator=accelerator)
-        sp = mod.export_posterior(
-            sp, sample_kwargs={'num_samples': 1000, 'batch_size': sp.n_obs},
-        )
-        abund = sp.obsm['q05_cell_abundance_w_sf'].copy()
-        abund.columns = [c.replace('q05cell_abundance_w_sf_', '')
-                         for c in abund.columns]
-        abund.to_csv(abund_path)
-        log(f"  saved abundances: {abund_path}")
-
-    # align abundances to the working object and write obs columns
-    abund = abund.reindex(adata.obs_names)
-    for ct in abund.columns:
-        adata.obs[f'c2l_{ct}'] = pd.to_numeric(abund[ct], errors='coerce').values
-    adata.obs['c2l_argmax'] = abund.astype(float).idxmax(axis=1).values
-    adata.obsm['c2l_abundance'] = abund.astype(float).values
-    adata.uns['c2l_celltypes'] = list(abund.columns)
-    adata.uns['c2l_detection_alpha'] = alpha
-
-    log(f"  cell2location argmax cell types: {adata.obs['c2l_argmax'].nunique()}")
-    for ct, n in adata.obs['c2l_argmax'].value_counts().head(10).items():
-        log(f"    {ct}: {n:,} ({100 * n / adata.n_obs:.1f}%)")
-    return adata
-
-
-# =========================================================================
 # POST-ANNOTATION PROCESSING
 # =========================================================================
 
@@ -499,48 +256,41 @@ def post_annotation_processing(adata):
     """
     banner("POST-ANNOTATION PROCESSING")
 
-    # Raw counts are the canonical source for both the Pearson embedding and
-    # cell2location. main() stores them before this runs; only set here if a
-    # caller invoked this function standalone without a counts layer.
-    if 'counts' not in adata.layers:
-        log(f"  Storing raw counts in layers['counts']...")
-        adata.layers['counts'] = adata.X.copy()
-    else:
-        log(f"  Using existing layers['counts'] (raw) as embedding source")
+    log(f"  Storing raw counts in layers['counts']...")
+    adata.layers['counts'] = adata.X.copy()
 
-    # --- Embedding via analytic Pearson residuals -----------------------
-    # The normalization bake-off (Step04_normalization_bakeoff.py) showed
-    # CPM+log1p left a library-size "snake" (depth_umap_corr 0.83) while
-    # Pearson residuals removed it (0.16). Residuals are computed from
-    # layers['counts'] on a throwaway copy; only X_pca is copied back. X is
-    # NOT read here, so the embedding cannot depend on whatever is in X.
-    log(f"  Building Pearson-residual embedding (HVG={N_PEARSON_HVG})...")
-    emb = adata.copy()
-    emb.X = emb.layers['counts'].copy()
-    sc.experimental.pp.highly_variable_genes(
-        emb, flavor='pearson_residuals', n_top_genes=N_PEARSON_HVG
-    )
-    emb = emb[:, emb.var['highly_variable']].copy()
-    sc.experimental.pp.normalize_pearson_residuals(emb)
-    n_comps = min(50, emb.n_vars - 1, emb.n_obs - 1)
-    sc.tl.pca(emb, svd_solver='arpack', n_comps=n_comps)
-    adata.obsm['X_pca'] = emb.obsm['X_pca']
-    adata.uns['pca'] = emb.uns['pca']
-    adata.var['highly_variable'] = adata.var_names.isin(emb.var_names)
-    log(f"    Pearson HVGs: {emb.n_vars:,}, PCA components: {n_comps}")
-    del emb
-
-    # AUDIT: X_pca exists and is Pearson-derived BEFORE log-CPM touches X.
-    # Everything downstream (neighbors/UMAP/Leiden) reads use_rep='X_pca'.
-    assert 'X_pca' in adata.obsm, "embedding (X_pca) not set before log-CPM"
-    log(f"  AUDIT: embedding = Pearson(counts) -> X_pca; log-CPM below is "
-        f"for plotting/DE only and never enters PCA/neighbors/UMAP/Leiden")
-
-    # Log-normalized X for visualization / gene plots / .raw (NOT the embedding)
-    log(f"  Log-normalizing X for plotting (CPM + log1p)...")
-    sc.pp.normalize_total(adata, target_sum=1e4)
+    log(f"  Normalizing (CPM + log1p)...")
+    sc.pp.normalize_total(adata, target_sum=1e6)
     sc.pp.log1p(adata)
     adata.raw = adata.copy()
+
+    # HVG selection (batch-aware, spatial adaptation)
+    log(f"  Selecting highly variable genes...")
+    try:
+        sc.pp.highly_variable_genes(
+            adata, min_mean=0.0125, max_mean=3, min_disp=0.5,
+            batch_key='puck_id',
+        )
+        n_hvg = adata.var['highly_variable'].sum()
+        log(f"    Batch-aware HVGs: {n_hvg:,}")
+    except Exception as e:
+        log(f"    Batch-aware HVG failed ({e}), using seurat_v3 top {N_HVG}...")
+        sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=N_HVG)
+        n_hvg = adata.var['highly_variable'].sum()
+        log(f"    Seurat v3 HVGs: {n_hvg:,}")
+
+    if n_hvg < 100:
+        log(f"    Too few HVGs ({n_hvg}), forcing top {N_HVG}...")
+        sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=N_HVG)
+
+    # PCA on HVGs
+    log(f"  Computing PCA on HVGs...")
+    adata_hvg = adata[:, adata.var['highly_variable']].copy()
+    n_comps = min(50, adata_hvg.n_vars - 1, adata_hvg.n_obs - 1)
+    sc.tl.pca(adata_hvg, svd_solver='arpack', n_comps=n_comps)
+    adata.obsm['X_pca'] = adata_hvg.obsm['X_pca']
+    adata.uns['pca'] = adata_hvg.uns['pca']
+    log(f"    PCA components: {n_comps}")
 
     n_pcs = min(N_PCS, n_comps)
 
@@ -649,65 +399,6 @@ def assign_cluster_based_annotation(adata):
         pct = 100 * count / adata.n_obs
         log(f"    {ct}: {count:,} ({pct:.1f}%)")
 
-    return adata
-
-
-# =========================================================================
-# popV + cell2location RECONCILIATION
-# =========================================================================
-
-def build_consensus_annotation(adata, ann_dir):
-    """
-    Reconcile popV (popv_prediction) with cell2location (c2l_argmax).
-
-    Because the two annotators use different label vocabularies, both are
-    mapped through LABEL_HARMONIZE onto a shared coarse vocabulary before
-    comparison. Unmapped labels are passed through verbatim (so they will
-    simply never 'agree' until added to the map).
-
-    Writes:
-      obs['consensus_annotation'] : shared label when both agree, else
-                                    'ambiguous:<popV>|<c2l>'
-      obs['consensus_agreement']  : 'agree' / 'disagree'
-      <ann_dir>/popv_vs_c2l_crosstab.tsv : empirical correspondence table
-                                           (use this to complete LABEL_HARMONIZE)
-    """
-    banner("popV + cell2location RECONCILIATION")
-
-    if 'c2l_argmax' not in adata.obs.columns:
-        log(f"  c2l_argmax missing; skipping reconciliation "
-            f"(cell2location stage did not run)")
-        return adata
-
-    pv = adata.obs['popv_prediction'].astype(str)
-    c2 = adata.obs['c2l_argmax'].astype(str)
-
-    # Raw crosstab BEFORE harmonization: this is the diagnostic that tells you
-    # which popV string corresponds to which cell2location type empirically.
-    ctab = pd.crosstab(pv, c2)
-    ctab_path = os.path.join(ann_dir, "popv_vs_c2l_crosstab.tsv")
-    ctab.to_csv(ctab_path, sep='\t')
-    log(f"  wrote popV-vs-c2l crosstab: {ctab_path}")
-    log(f"    (review this, then complete the popV side of LABEL_HARMONIZE)")
-
-    pv_h = pv.map(lambda x: LABEL_HARMONIZE.get(x, x))
-    c2_h = c2.map(lambda x: LABEL_HARMONIZE.get(x, x))
-    agree = (pv_h.values == c2_h.values)
-
-    adata.obs['consensus_agreement'] = np.where(agree, 'agree', 'disagree')
-    adata.obs['consensus_annotation'] = np.where(
-        agree, pv_h.values,
-        np.char.add(np.char.add('ambiguous:' + pv_h.values.astype(str), '|'),
-                    c2_h.values.astype(str))
-    )
-
-    n_mapped_pv = pv.isin(LABEL_HARMONIZE).sum()
-    log(f"  popV labels covered by LABEL_HARMONIZE: "
-        f"{n_mapped_pv:,}/{adata.n_obs:,} beads "
-        f"({100 * n_mapped_pv / adata.n_obs:.1f}%)")
-    log(f"  popV/cell2location agreement: "
-        f"{100 * agree.mean():.1f}% of beads "
-        f"(meaningful only once the popV side of the map is filled in)")
     return adata
 
 
@@ -842,53 +533,8 @@ def plot_umap_final_annotation_labeled(adata, fig_dir):
     save_fig(fig, 'UMAP_final_annotation_labeled', fig_dir)
 
 
-def plot_consensus_umaps(adata, fig_dir):
-    """UMAPs for cell2location argmax, the popV/c2l consensus, and agreement."""
-    effects = [pe.withStroke(linewidth=6, foreground="white"), pe.Normal()]
-
-    # cell2location argmax (categorical, labeled)
-    if 'c2l_argmax' in adata.obs.columns:
-        adata.obs['c2l_argmax'] = adata.obs['c2l_argmax'].astype('category')
-        fig, ax = plt.subplots(figsize=(14, 12))
-        sc.pl.umap(adata, color='c2l_argmax', ax=ax, show=False,
-                   legend_loc=None, frameon=False, size=3)
-        gen_mpl_labels(
-            adata, 'c2l_argmax', exclude=("", "None", "nan"), ax=ax,
-            adjust_kwargs=dict(arrowprops=dict(arrowstyle='-', color='black', lw=0.5)),
-            text_kwargs=dict(fontsize=16, fontweight='bold', path_effects=effects),
-        )
-        fig.tight_layout()
-        save_fig(fig, 'UMAP_c2l_argmax_labeled', fig_dir)
-
-    # consensus annotation (categorical, labeled)
-    if 'consensus_annotation' in adata.obs.columns:
-        adata.obs['consensus_annotation'] = adata.obs['consensus_annotation'].astype('category')
-        fig, ax = plt.subplots(figsize=(14, 12))
-        sc.pl.umap(adata, color='consensus_annotation', ax=ax, show=False,
-                   legend_loc=None, frameon=False, size=3)
-        gen_mpl_labels(
-            adata, 'consensus_annotation',
-            exclude=("", "None", "nan"), ax=ax,
-            adjust_kwargs=dict(arrowprops=dict(arrowstyle='-', color='black', lw=0.5)),
-            text_kwargs=dict(fontsize=14, fontweight='bold', path_effects=effects),
-        )
-        fig.tight_layout()
-        save_fig(fig, 'UMAP_consensus_annotation_labeled', fig_dir)
-
-    # agreement map (two fixed hex colors)
-    if 'consensus_agreement' in adata.obs.columns:
-        adata.obs['consensus_agreement'] = adata.obs['consensus_agreement'].astype('category')
-        fig, ax = plt.subplots(figsize=(12, 11))
-        sc.pl.umap(
-            adata, color='consensus_agreement', ax=ax, show=False,
-            frameon=False, size=3,
-            palette={'agree': '#4c956c', 'disagree': '#d1495b'},
-        )
-        fig.tight_layout()
-        save_fig(fig, 'UMAP_consensus_agreement', fig_dir)
-
-
-
+def plot_batch_correction_comparison(adata, fig_dir):
+    """Side-by-side puck-colored UMAP: pre-correction vs post-BBKNN."""
     pucks = sorted(adata.obs['puck_id'].astype(str).unique())
     cmap = plt.colormaps['turbo']
     colors = {p: to_hex(cmap(i / max(len(pucks) - 1, 1)))
@@ -1035,67 +681,43 @@ def export_summaries(adata, ann_dir):
 # =========================================================================
 
 def main():
-    banner("STEP 04: CELL TYPE ANNOTATION + CELL2LOCATION (v5)")
+    banner("STEP 04: CELL TYPE ANNOTATION AND CLUSTERING (v3)")
     log(f"  Input:  {DIR_03_QC}")
     log(f"  Output: {DIR_04_ANNOTATION}")
     log(f"  BBKNN:  RUN_BBKNN={RUN_BBKNN}, batch_key={BBKNN_BATCH_KEY}, "
         f"cluster_after_bbknn={CLUSTER_AFTER_BBKNN}")
-    log(f"  c2l:    alpha={C2L_CFG['detection_alpha']}, "
-        f"N_cells={C2L_CFG['n_cells_per_location']}, ref={C2L_REFERENCE_PATH}")
 
     ann_dir = ensure_dir(DIR_04_ANNOTATION)
     ann_fig_dir = ensure_dir(os.path.join(DIR_04_ANNOTATION, "figures"))
     cache_dir = os.path.join(ann_dir, "popv_cache")
-    c2l_dir = ensure_dir(os.path.join(ann_dir, "cell2location"))
 
-    # --- popV annotation (reuse checkpoint if present, else run + save) ---
+    # --- Load merged QC data ---
+    banner("LOADING MERGED QC DATA")
+    merged_path = os.path.join(DIR_03_QC, "all_pucks_merged_QC.h5ad")
+    if not os.path.exists(merged_path):
+        log(f"  FATAL: {merged_path} not found. Run Step03 first.")
+        sys.exit(1)
+
+    adata = sc.read_h5ad(merged_path)
+    log(f"  Loaded: {adata.n_obs:,} cells, {adata.n_vars:,} genes")
+    log(f"  Pucks: {adata.obs['puck_id'].value_counts().to_dict()}")
+
+    # --- popV annotation (on raw counts) ---
+    adata = run_popv_annotation(adata, cache_dir)
+
+    # Save popV-annotated checkpoint (sanitized write)
     popv_path = os.path.join(ann_dir, "all_pucks_popv_annotated.h5ad")
-    if os.path.exists(popv_path):
-        banner("LOADING popV CHECKPOINT")
-        adata = sc.read_h5ad(popv_path)
-        log(f"  [cache] {popv_path}")
-        log(f"  Loaded: {adata.n_obs:,} cells, {adata.n_vars:,} genes")
-        if 'popv_prediction' not in adata.obs.columns:
-            log(f"  FATAL: checkpoint missing popv_prediction; "
-                f"delete it to force a fresh popV run.")
-            sys.exit(1)
-    else:
-        banner("LOADING MERGED QC DATA")
-        merged_path = os.path.join(DIR_03_QC, "all_pucks_merged_QC.h5ad")
-        if not os.path.exists(merged_path):
-            log(f"  FATAL: {merged_path} not found. Run Step03 first.")
-            sys.exit(1)
-        adata = sc.read_h5ad(merged_path)
-        log(f"  Loaded: {adata.n_obs:,} cells, {adata.n_vars:,} genes")
-        log(f"  Pucks: {adata.obs['puck_id'].value_counts().to_dict()}")
+    safe_write(adata, popv_path)
+    log(f"  Checkpoint saved: {popv_path}")
 
-        adata = run_popv_annotation(adata, cache_dir)
-        safe_write(adata, popv_path)
-        log(f"  Checkpoint saved: {popv_path}")
-
-    # --- Canonical raw counts (source for BOTH cell2location and Pearson) ---
-    # At this point adata.X is still raw integer counts (popV does not modify
-    # X in place for the query). Stash before any normalization touches X.
-    if 'counts' not in adata.layers:
-        adata.layers['counts'] = adata.X.copy()
-        log(f"  Stored raw counts in layers['counts'] "
-            f"(canonical source for c2l + Pearson)")
-
-    # --- cell2location deconvolution (checkpointed) ---
-    adata = run_cell2location(adata, c2l_dir)
-
-    # --- Post-annotation processing (Pearson embedding, BBKNN, cluster) ---
+    # --- Post-annotation processing (normalize, BBKNN, cluster) ---
     adata = post_annotation_processing(adata)
 
-    # --- popV cluster-based annotation (final_annotation, unchanged) ---
+    # --- Cluster-based consensus annotation ---
     adata = assign_cluster_based_annotation(adata)
-
-    # --- popV + cell2location reconciliation (consensus_annotation) ---
-    adata = build_consensus_annotation(adata, ann_dir)
 
     # --- Visualization ---
     generate_annotation_plots(adata, ann_fig_dir)
-    plot_consensus_umaps(adata, ann_fig_dir)
 
     # --- Export summaries ---
     export_summaries(adata, ann_dir)
@@ -1124,13 +746,6 @@ def main():
     log(f"  Batch corrected: {adata.uns.get('batch_corrected', False)}")
     if 'final_annotation' in adata.obs.columns:
         log(f"  Cell types:    {adata.obs['final_annotation'].nunique()}")
-    if 'c2l_argmax' in adata.obs.columns:
-        log(f"  c2l argmax types: {adata.obs['c2l_argmax'].nunique()} "
-            f"(detection_alpha={adata.uns.get('c2l_detection_alpha', '?')})")
-    if 'consensus_agreement' in adata.obs.columns:
-        frac = (adata.obs['consensus_agreement'] == 'agree').mean()
-        log(f"  popV/c2l agreement: {100 * frac:.1f}% "
-            f"(after LABEL_HARMONIZE; complete the map for a true number)")
     log(f"  Layers:        {list(adata.layers.keys())}")
 
     log(f"\n  Cells per puck:")
@@ -1140,10 +755,8 @@ def main():
 
     banner("STEP 04 COMPLETE")
     log(f"  Output: {DIR_04_ANNOTATION}/")
-    log(f"  Review: {os.path.join(DIR_04_ANNOTATION, 'popv_vs_c2l_crosstab.tsv')}")
-    log(f"          -> complete the popV side of LABEL_HARMONIZE, rerun")
-    log(f"             (cell2location abundances are cached, so it is fast)")
-    log(f"  Sweep:  set C2L_CFG['detection_alpha']=200 and rerun to compare")
+    log(f"  Next: Step05 (HPV detection with Kraken2) or")
+    log(f"        Step06 (SComatic mutation calling)")
 
 
 if __name__ == "__main__":
