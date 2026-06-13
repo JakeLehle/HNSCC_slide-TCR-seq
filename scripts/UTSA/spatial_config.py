@@ -78,9 +78,9 @@ NMF_PROTEOME           = os.path.join(NMF_PAPER_ROOT, "data", "reference",
 # (build_cell2location_reference.py): raw counts, obs['final_annotation']
 # (12 types), batch column 'subject id'. Staged INTO this project so the UTSA
 # pipeline is self-contained and does not depend on the NMF tree above. Step04
-# imports this name; if it is ever missing, the v5 script falls back to a stale
-# /master path, so keep it defined here. Move the .h5ad to this location:
-#   <PROJECT_ROOT>/data/inputs/reference/reference_for_cell2location.h5ad
+# imports this name; if it is ever missing, the script falls back to a stale
+# path, so keep it defined here. Move the .h5ad to this location:
+#   <PROJECT_ROOT>/data/inputs/annotation/reference_for_cell2location.h5ad
 C2L_REFERENCE_PATH = os.path.join(INPUT_DIR, "annotation",
                                   "reference_for_cell2location.h5ad")
 
