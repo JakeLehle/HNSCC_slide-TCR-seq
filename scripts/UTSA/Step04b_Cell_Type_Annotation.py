@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Step04_Cell_Type_Annotation.py
+Step04b_Cell_Type_Annotation.py
 
 cell2location deconvolution + Pearson embedding + clustering + popV/c2l
 consensus annotation for QC'd Slide-seq data.
@@ -10,7 +10,7 @@ This is the GPU half of a SPLIT Step04:
 
     Step04a_popV_only.py              popV annotation       -> CPU job, writes
                                                                the popV checkpoint
-    Step04_Cell_Type_Annotation.py    cell2location onward  -> GPU job (this file)
+    Step04b_Cell_Type_Annotation.py   cell2location onward  -> GPU job (this file)
 
 This script REQUIRES the popV checkpoint (all_pucks_popv_annotated.h5ad) and
 never runs popV itself. See "WHY THE SPLIT" in PROTECTED CONSTRAINTS below.
@@ -52,6 +52,11 @@ PROTECTED CONSTRAINTS (do not break; each was learned the slow way on UTSA)
   once. (popv.settings.accelerator='auto' does route scVI/scANVI to a GPU when
   one is present, but cuml=False leaves the kNN/UMAP/integration bulk on CPU;
   not worth chasing given the env conflict above.)
+- popV reuses settings.n_jobs as lightning's `devices` count for its scVI/scANVI
+  members when cuml is off (algorithms/_scvi.py). KEEP n_jobs=1 in Step04a.
+  n_jobs>1 -> multi-device DDP on CPU -> scVI covariate-encoder crash
+  "expand(... {[1,1,512,281]}, size=[1,1,512])". n_jobs does not speed the
+  bbknn/harmony integration steps (the actual slow parts) anyway.
 - WHY THE SPLIT: a monolithic popV+cell2location GPU job was cancelled by a
   GPU-idle reaper ~2h in (gpu039) because popV held the a100 idle through its
   CPU ensemble. Decoupling popV onto a CPU node removes the idle window; this
@@ -70,12 +75,14 @@ PROTECTED CONSTRAINTS (do not break; each was learned the slow way on UTSA)
   PCA/neighbors/UMAP/Leiden. See the AUDIT assertion in
   post_annotation_processing(). (Bake-off: Pearson depth_umap_corr 0.16 vs
   CPM+log1p 0.83.)
-- VRAM WATCH (40GB a100): the map trains full-batch (batch_size=None) and
-  export_posterior samples full-batch (batch_size=n_obs, 1000 samples).
-  ~99k beads x 12 cell types fits, but a CUDA OOM points at exactly those two
-  batch_size lines. Spatial abundances cache (c2l_abundances_alpha{N}.csv)
-  BEFORE the embedding/BBKNN/Leiden steps, so any post-map crash resumes in
-  minutes and the 30000-epoch map only ever runs once.
+- VRAM WATCH (40GB a100): full-batch (batch_size=None) does NOT fit ~99k beads
+  x 12,730 genes -> CUDA OOM at the GammaPoisson params (the per-bead-by-gene
+  expectation tensors, ~5GB each). FIX: the map trains AND export_posterior
+  samples in minibatches of C2L_CFG['map_batch_size'] (=20000), which holds
+  40GB with headroom; train_size=1 keeps all beads. Raise map_batch_size only
+  if VRAM allows; lower it if you still OOM. Spatial abundances cache
+  (c2l_abundances_alpha{N}.csv) BEFORE the embedding/BBKNN/Leiden steps, so any
+  post-map crash resumes in minutes and the 30000-epoch map only runs once.
 - C2L REFERENCE: spatial_config.C2L_REFERENCE_PATH ->
   data/inputs/annotation/reference_for_cell2location.h5ad (HUGO symbols,
   obs['final_annotation'] = 12 types, batch column 'subject id' renamed to
@@ -197,10 +204,15 @@ C2L_REF_BATCH_KEY = "subject_id"        # 'subject id' is renamed to this
 C2L_LABELS_KEY    = "final_annotation"  # reference cell-type column
 
 C2L_CFG = {
-    "n_cells_per_location": 1,   # near-single-cell Slide-seq beads
-    "detection_alpha":      20,  # high within-slide variability; try 200 too
+    "n_cells_per_location": 1,      # near-single-cell Slide-seq beads
+    "detection_alpha":      20,     # high within-slide variability; try 200 too
     "ref_epochs":           250,
     "map_epochs":           30000,
+    "map_batch_size":       20000,  # minibatch the spatial map to fit 40GB VRAM.
+                                    # full-batch (None) OOMs ~99k beads x 12,730
+                                    # genes on an a100. train_size=1 still uses
+                                    # all data; raise if VRAM allows, lower if it
+                                    # still OOMs. Also used for posterior sampling.
 }
 
 # popV (Tabula Sapiens vocab) <-> cell2location (HNSCC ref vocab) harmonization.
@@ -523,11 +535,20 @@ def run_cell2location(adata, out_dir):
         )
         log(f"  training Cell2location (alpha={alpha}, "
             f"N_cells={C2L_CFG['n_cells_per_location']}, "
-            f"max_epochs={C2L_CFG['map_epochs']}, accelerator={accelerator})...")
+            f"max_epochs={C2L_CFG['map_epochs']}, "
+            f"batch_size={C2L_CFG['map_batch_size']}, "
+            f"accelerator={accelerator})...")
+        # Minibatched to fit 40GB VRAM. train_size=1 -> all beads still used,
+        # just fed in batches of map_batch_size. Full-batch (batch_size=None)
+        # OOMs at the GammaPoisson params on ~99k beads x 12,730 genes.
         mod.train(max_epochs=C2L_CFG['map_epochs'],
-                  batch_size=None, train_size=1, accelerator=accelerator)
+                  batch_size=C2L_CFG['map_batch_size'], train_size=1,
+                  accelerator=accelerator)
+        # Posterior sampling is also obs-scaled, so it must minibatch too or it
+        # OOMs the same way a few minutes after training finishes.
         sp = mod.export_posterior(
-            sp, sample_kwargs={'num_samples': 1000, 'batch_size': sp.n_obs},
+            sp, sample_kwargs={'num_samples': 1000,
+                               'batch_size': C2L_CFG['map_batch_size']},
         )
         abund = sp.obsm['q05_cell_abundance_w_sf'].copy()
         abund.columns = [c.replace('q05cell_abundance_w_sf_', '')
@@ -956,7 +977,15 @@ def plot_consensus_umaps(adata, fig_dir):
         save_fig(fig, 'UMAP_consensus_agreement', fig_dir)
 
 
+def plot_batch_correction_comparison(adata, fig_dir):
+    """Before/after BBKNN UMAP, colored by puck (two-panel).
 
+    Pulled out into its own function. This block used to sit orphaned at the
+    tail of plot_consensus_umaps(), which left generate_annotation_plots()'s
+    call to plot_batch_correction_comparison() pointing at an undefined name
+    (a NameError that would fire at the plotting stage, i.e. AFTER the
+    expensive cell2location map had already run).
+    """
     pucks = sorted(adata.obs['puck_id'].astype(str).unique())
     cmap = plt.colormaps['turbo']
     colors = {p: to_hex(cmap(i / max(len(pucks) - 1, 1)))
@@ -1212,4 +1241,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,0 +1,15 @@
+# =============================================================================
+# Slide TCR-seq .gitignore
+# =============================================================================
+# This file specifies which files and directories Git should ignore.
+# These are typically generated files, build artifacts, and user-specific
+# configuration that shouldn't be tracked in version control.
+# =============================================================================
+
+# =============================================================================
+# Python Build & Installation Artifacts
+# =============================================================================
+
+# Build directories (created by pip install -e . or python setup.py build)
+scripts/UTSA/TROUBLE_SHOOTING/tmp
+scripts/UTSA/__pycache__
