@@ -215,29 +215,56 @@ C2L_CFG = {
                                     # still OOMs. Also used for posterior sampling.
 }
 
-# popV (Tabula Sapiens vocab) <-> cell2location (HNSCC ref vocab) harmonization.
-# Maps BOTH vocabularies onto a shared coarse label so the two annotators can
-# be compared. The cell2location side is seeded from the reference's 12 types.
-# The popV side is INTENTIONALLY INCOMPLETE: review the popv-vs-c2l crosstab
-# written by build_consensus_annotation(), then fill in the popV strings.
+# popV (Tabula Sapiens) <-> cell2location (HNSCC ref) harmonization onto a
+# shared COARSE vocabulary. Deliberately compartment-level, not subtype-level:
+# Slide-seq beads are too sparse (~358 genes) for reliable T/DC subtyping, and
+# the crosstab showed popV subtype calls scatter badly against c2l. Get the lay
+# of the land here; revisit subtypes once mutated cells + neighboring T cells
+# are localized. popv_prediction AND c2l_argmax are kept as separate obs columns
+# for a manual-marker bake-off; this map only drives consensus_annotation.
+# Shared labels: epithelial, T_cell, B_cell, myeloid, fibroblast, endothelial,
+# smooth_muscle, mast. Unmapped popV labels -> 'unresolved' in the consensus.
 LABEL_HARMONIZE = {
-    # ---- cell2location reference labels (final_annotation) -> shared ----
-    "basal cell":   "epithelial",
-    "CD4 T":        "CD4_T",
-    "CD8 T":        "CD8_T",
-    "Treg":         "Treg",
-    "B":            "B",
-    "macrophage":   "macrophage",
-    "fibroblast":   "fibroblast",
-    "endothelial":  "endothelial",
-    "smooth muscle":"smooth_muscle",
-    "pDC":          "pDC",
-    "mast":         "mast",
-    "mDC":          "mDC",
-    # ---- popV labels (Tabula Sapiens) -> shared  [FILL IN FROM CROSSTAB] ----
-    # e.g. "cd4-positive, alpha-beta t cell": "CD4_T",
-    #      "cd8-positive, alpha-beta t cell": "CD8_T",
-    #      "b cell": "B", "macrophage": "macrophage", ...
+    # ---- cell2location reference labels (c2l_argmax, exact strings) ----
+    "basal cell":                          "epithelial",
+    "CD4-positive, alpha-beta T cell":     "T_cell",
+    "CD8-positive, alpha-beta T cell":     "T_cell",
+    "regulatory T cell":                   "T_cell",
+    "B cell":                              "B_cell",
+    "macrophage":                          "myeloid",
+    "myeloid dendritic cell":              "myeloid",
+    "plasmacytoid dendritic cell":         "myeloid",
+    "fibroblast":                          "fibroblast",
+    "endothelial cell":                    "endothelial",
+    "smooth muscle cell":                  "smooth_muscle",
+    "mast cell":                           "mast",
+    # ---- popV labels (Tabula Sapiens) onto the same shared vocab -------
+    # epithelial (squamous tumor compartment; popV mislabels are still epithelium)
+    "stratified squamous epithelial cell": "epithelial",
+    "bladder urothelial cell":             "epithelial",
+    "tracheal goblet cell":                "epithelial",
+    # T cell (all subtypes collapse)
+    "T cell":                              "T_cell",
+    "mature NK T cell":                    "T_cell",
+    # B / plasma
+    "plasma cell":                         "B_cell",
+    # myeloid (macrophage / monocyte / DC continuum)
+    "monocyte":                            "myeloid",
+    "classical monocyte":                  "myeloid",
+    "non-classical monocyte":              "myeloid",
+    "mononuclear phagocyte":               "myeloid",
+    "microglial cell":                     "myeloid",
+    "conventional dendritic cell":         "myeloid",
+    "myeloid leukocyte":                   "myeloid",
+    # stromal / vascular
+    "stromal cell":                        "fibroblast",
+    "myofibroblast cell":                  "fibroblast",
+    "endothelial cell of lymphatic vessel":"endothelial",
+    "mural cell":                          "smooth_muscle",
+    # INTENTIONALLY UNMAPPED -> 'unresolved' (no counterpart in the 12-type
+    # reference): leukocyte (~9.5k), innate lymphoid cell (~3k), neutrophil
+    # (~1.8k), granulocyte/basophil, wrong-tissue tail. Full detail stays in
+    # popv_prediction.
 }
 
 import matplotlib
@@ -747,58 +774,70 @@ def assign_cluster_based_annotation(adata):
 
 def build_consensus_annotation(adata, ann_dir):
     """
-    Reconcile popV (popv_prediction) with cell2location (c2l_argmax).
+    Reconcile popV (popv_prediction) with cell2location (c2l_argmax) onto the
+    shared COARSE vocabulary defined in LABEL_HARMONIZE. Unmapped popV labels
+    are bucketed 'unresolved' (no counterpart in the 12-type reference), so
+    they can never agree, by design.
 
-    Because the two annotators use different label vocabularies, both are
-    mapped through LABEL_HARMONIZE onto a shared coarse vocabulary before
-    comparison. Unmapped labels are passed through verbatim (so they will
-    simply never 'agree' until added to the map).
+    popv_prediction and c2l_argmax are RETAINED UNCHANGED as separate obs
+    columns; this is only a reconciliation/confidence overlay for the bake-off.
 
     Writes:
-      obs['consensus_annotation'] : shared label when both agree, else
-                                    'ambiguous:<popV>|<c2l>'
+      obs['consensus_annotation'] : shared label if both agree, else
+                                    'ambiguous:<popV_h>|<c2l_h>'
       obs['consensus_agreement']  : 'agree' / 'disagree'
-      <ann_dir>/popv_vs_c2l_crosstab.tsv : empirical correspondence table
-                                           (use this to complete LABEL_HARMONIZE)
+      <ann_dir>/popv_vs_c2l_crosstab.tsv : raw correspondence table
     """
     banner("popV + cell2location RECONCILIATION")
 
     if 'c2l_argmax' not in adata.obs.columns:
-        log(f"  c2l_argmax missing; skipping reconciliation "
-            f"(cell2location stage did not run)")
+        log("  c2l_argmax missing; skipping reconciliation "
+            "(cell2location stage did not run)")
         return adata
 
     pv = adata.obs['popv_prediction'].astype(str)
     c2 = adata.obs['c2l_argmax'].astype(str)
 
-    # Raw crosstab BEFORE harmonization: this is the diagnostic that tells you
-    # which popV string corresponds to which cell2location type empirically.
+    # Raw crosstab BEFORE harmonization (audit trail / diagnostic).
     ctab = pd.crosstab(pv, c2)
     ctab_path = os.path.join(ann_dir, "popv_vs_c2l_crosstab.tsv")
     ctab.to_csv(ctab_path, sep='\t')
     log(f"  wrote popV-vs-c2l crosstab: {ctab_path}")
-    log(f"    (review this, then complete the popV side of LABEL_HARMONIZE)")
 
-    pv_h = pv.map(lambda x: LABEL_HARMONIZE.get(x, x))
-    c2_h = c2.map(lambda x: LABEL_HARMONIZE.get(x, x))
+    # Harmonize onto shared coarse vocab; unmapped popV -> 'unresolved'.
+    pv_h = pv.map(lambda x: LABEL_HARMONIZE.get(x, "unresolved"))
+    c2_h = c2.map(lambda x: LABEL_HARMONIZE.get(x, "unresolved"))
     agree = (pv_h.values == c2_h.values)
 
     adata.obs['consensus_agreement'] = np.where(agree, 'agree', 'disagree')
+    # pandas element-wise string concat. numpy '+' has no string ufunc loop in
+    # numpy 1.x ('ambiguous:' + array), which is what crashed the prior run.
+    ambiguous = 'ambiguous:' + pv_h.astype(str) + '|' + c2_h.astype(str)
     adata.obs['consensus_annotation'] = np.where(
-        agree, pv_h.values,
-        np.char.add(np.char.add('ambiguous:' + pv_h.values.astype(str), '|'),
-                    c2_h.values.astype(str))
+        agree, pv_h.values, ambiguous.values
     )
 
-    n_mapped_pv = pv.isin(LABEL_HARMONIZE).sum()
-    log(f"  popV labels covered by LABEL_HARMONIZE: "
-        f"{n_mapped_pv:,}/{adata.n_obs:,} beads "
-        f"({100 * n_mapped_pv / adata.n_obs:.1f}%)")
-    log(f"  popV/cell2location agreement: "
-        f"{100 * agree.mean():.1f}% of beads "
-        f"(meaningful only once the popV side of the map is filled in)")
+    # ---- diagnostics (copy these out of the log) ------------------------
+    n = adata.n_obs
+    n_unres = int((pv_h.values == "unresolved").sum())
+    log("  harmonized popV distribution (shared vocab):")
+    for lab, c in pv_h.value_counts().items():
+        log(f"    {lab}: {c:,} ({100 * c / n:.1f}%)")
+    log("  harmonized c2l distribution (shared vocab):")
+    for lab, c in c2_h.value_counts().items():
+        log(f"    {lab}: {c:,} ({100 * c / n:.1f}%)")
+    log(f"  popV unresolved (no reference counterpart): {n_unres:,} "
+        f"({100 * n_unres / n:.1f}%)")
+    log(f"  overall agreement: {100 * agree.mean():.1f}% "
+        f"({int(agree.sum()):,}/{n:,} beads)")
+    log("  agreement by compartment (both call the same shared label):")
+    for lab, k in pv_h[agree].value_counts().items():
+        log(f"    {lab}: {k:,}")
+    log("  top consensus_annotation categories:")
+    for lab, c in adata.obs['consensus_annotation'].value_counts().head(15).items():
+        log(f"    {lab}: {c:,} ({100 * c / n:.1f}%)")
+    log("  NOTE popv_prediction + c2l_argmax kept unchanged for the bake-off")
     return adata
-
 
 # =========================================================================
 # VISUALIZATION
