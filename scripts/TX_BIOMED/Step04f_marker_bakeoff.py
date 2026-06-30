@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Step04f_marker_bakeoff_v2.py
+Step04f_marker_bakeoff_v3.py
 =========================================================================
-(See v1 header for full MARKER PANEL PROVENANCE; unchanged in v2.)
+(See v1 header for full MARKER PANEL PROVENANCE; unchanged in v3.)
 
 PURPOSE
   Adjudicate popV-vs-cell2location disagreements with an independent marker
   signal, producing `unified_annotation`. popV, cell2location, and consensus
   columns are preserved untouched.
 
-RESOLUTION (changed in v2)
-  unified_annotation is now a PER-BEAD call (argmax over the 8 compartment
-  marker scores), gated so beads whose top score is not above background
-  (<= 0) are labeled 'ambiguous'. The cluster-level margin-weighted vote is
-  retained only as a diagnostic (cluster_marker_label / _confidence), NOT as
-  the annotation.
+RESOLUTION (set in v2, unchanged)
+  unified_annotation is a PER-BEAD call (argmax over the 8 compartment marker
+  scores), gated so beads whose top score is not above background (<= 0) are
+  labeled 'ambiguous'. The cluster-level margin-weighted vote is retained only
+  as a diagnostic (cluster_marker_label / _confidence), NOT as the annotation.
 
 CHANGELOG
   v1  cluster-level rollup. REJECTED after diagnostic: sparse beads do not
@@ -26,6 +25,30 @@ CHANGELOG
   v2  unified_annotation = per-bead argmax gated at top_score>0; cluster vote
       demoted to diagnostic; fixed categorical .map crash in the T-cell
       diagnostic (cast to str before mapping).
+  v3  Two changes from the T-mask diagnostic
+      (Diagnostic_marker_DEG_and_Tcell_mask.py), folded in together:
+        (a) DROP PTPRC from the T panel. PTPRC (CD45) is pan-leukocyte and
+            cannot discriminate T from other leukocytes; it entered the T
+            panel through the reference-significant INTERSECT PanglaoDB step,
+            not the curated anchors. The PTPRC-drop flip test showed 19.8% of
+            T calls (1,155 beads) reassign when PTPRC is removed, the largest
+            sinks being myeloid (545) and B_cell (154), i.e. PTPRC was
+            inflating the T score for non-T leukocytes. Removing it sharpens
+            the T mask for the neoantigen + clonally-expanded-TCR
+            colocalization (Asana task 3.3), trading ~20% recall for
+            precision. Implemented as a documented MANUAL_DROP folded into the
+            existing prune set, so the panel rebuild stays runtime-derived
+            from the Step04e artifact plus stated rules. Expected effect:
+            unified_annotation T_cell 5,825 -> ~4,670.
+            We deliberately did NOT add an NK-exclusion rule: NK-specific
+            markers (NCAM1, FCGR3A) were flat and the composite NK score in T
+            beads matched background, so the mild NKG7/GNLY signal reflects
+            legitimate CD8 cytotoxic T cells, which such a rule would delete.
+        (b) FIX per-puck spatial faceting. The real column is `puck_id`, which
+            was missing from the candidate list, so unified_spatial silently
+            fell back to a single 'all' panel and overlaid the three pucks on
+            shared coordinates. Added puck_id (first), a breadcrumb log of the
+            resolved column, and stable sorted ordering. No effect on labels.
 =========================================================================
 """
 
@@ -67,6 +90,12 @@ CURATED = {
 }
 PLASMA_ADD = ["MZB1", "DERL3", "XBP1", "TNFRSF17", "PRDM1"]
 
+# v3: pan-leukocyte / non-discriminating genes removed after the T-mask
+# diagnostic. PTPRC (CD45) is on every leukocyte and cannot separate T from
+# myeloid/B; the flip test showed it inflated the T score for non-T leukocytes
+# (see header CHANGELOG v3a). Applied globally but only present in the T panel.
+MANUAL_DROP = {"PTPRC"}
+
 
 def log(m): print(m, flush=True)
 
@@ -75,7 +104,7 @@ def antigen_presentation(g):
     return g.startswith("HLA-D") or g == "CD74"
 
 
-log("=" * 70 + "\nSTEP04f v2  marker bake-off\n" + "=" * 70)
+log("=" * 70 + "\nSTEP04f v3  marker bake-off\n" + "=" * 70)
 
 inter = pd.read_csv(INTERSECT, sep="\t")
 proposed = {r["compartment"]: [g for g in str(r["proposed_panel"]).split(";") if g]
@@ -89,9 +118,10 @@ for c in COMPARTMENTS:
         counts.setdefault(g, set()).add(c)
 cross_panel = {g for g, comps in counts.items() if len(comps) >= 2}
 ap_block = {g for g in counts if antigen_presentation(g)}
-prune = cross_panel | ap_block
+prune = cross_panel | ap_block | MANUAL_DROP
 log(f"  cross-panel pruned: {sorted(cross_panel)}")
 log(f"  antigen-presentation pruned: {sorted(ap_block)}")
+log(f"  manual pan-leukocyte drop (v3): {sorted(MANUAL_DROP)}")
 
 log(f"\nloading {ANNOTATED}")
 adata = sc.read_h5ad(ANNOTATED)
@@ -103,9 +133,12 @@ for c in COMPARTMENTS:
     keep = []
     for g in augmented[c]:
         if g in prune:
-            reason = ("cross_panel_shared" if g in cross_panel else "") + \
-                     ("|antigen_presentation" if g in ap_block else "")
-            pruned_rows.append({"gene": g, "compartment": c, "reason": reason.strip("|")})
+            reason = "|".join(r for r, cond in [
+                ("cross_panel_shared", g in cross_panel),
+                ("antigen_presentation", g in ap_block),
+                ("pan_leukocyte_manual_drop", g in MANUAL_DROP),
+            ] if cond)
+            pruned_rows.append({"gene": g, "compartment": c, "reason": reason})
             continue
         if g not in spatial_genes:
             pruned_rows.append({"gene": g, "compartment": c, "reason": "absent_from_spatial_panel"})
@@ -170,6 +203,7 @@ log(pd.Series(argmax_comp).value_counts().to_string())
 log("\n=== unified_annotation (per-bead, gated top_score>0) ===")
 log(adata.obs["unified_annotation"].value_counts().to_string())
 log(f"  ambiguous (top score <= 0): {(top_score <= 0).sum():,} ({100*(top_score <= 0).mean():.1f}%)")
+log(f"  [v3 check] expect T_cell ~= 4,670 (flip-test prediction after PTPRC drop)")
 log("\n=== cluster-level vote (DIAGNOSTIC ONLY, not the annotation) ===")
 log(adata.obs["cluster_marker_label"].value_counts().to_string())
 
@@ -204,10 +238,13 @@ if "X_umap" in adata.obsm:
     ax.axis("off"); ax.legend(markerscale=6, fontsize=14, frameon=False)
     save(fig, "unified_umap")
 
-puck_col = next((c for c in ["puck", "sample", "library", "batch", "sample_id"]
+# v3: puck_id is the real column; add it (first) and order the panels stably so
+# the three pucks are faceted instead of overlaid on shared coordinates.
+puck_col = next((c for c in ["puck_id", "puck", "sample", "library", "batch", "sample_id"]
                  if c in adata.obs.columns), None)
+log(f"  spatial facet column: {puck_col}")
 if {"x_coord", "y_coord"}.issubset(adata.obs.columns):
-    pucks = adata.obs[puck_col].astype(str).unique() if puck_col else ["all"]
+    pucks = sorted(adata.obs[puck_col].astype(str).unique()) if puck_col else ["all"]
     fig, axes = plt.subplots(1, len(pucks), figsize=(7 * len(pucks), 7), squeeze=False)
     for j, pk in enumerate(pucks):
         ax = axes[0, j]
