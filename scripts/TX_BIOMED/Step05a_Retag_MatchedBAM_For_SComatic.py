@@ -127,6 +127,39 @@ ANNOT_COLS = ["unified_annotation", "consensus_annotation"]
 MIN_BEADS      = 500
 COLLAPSE_LABEL = "low_n_other"
 
+# --- CB format ----------------------------------------------------------
+# EVERY SComatic script truncates the barcode at the first hyphen:
+#     SplitBamCellTypes.py:74, BaseCellCounter.py:243,
+#     SitesPerCell.py:177, SingleCellGenotype.py:165 and :204
+# all run `barcode = barcode.split("-")[0]` (standard 10x "-1" handling).
+#
+# Our CB is the h5ad obs_name, "TATATGATTCTCGT-1_Puck_211214_29", so that
+# split discards BOTH the suffix and the puck tag and leaves the bare 14 nt
+# barcode. Two consequences:
+#   1. Output labels lose the puck. Step05c recovers them from this BAM.
+#   2. Worse, reads from beads sharing a bare barcode ACROSS PUCKS are
+#      pooled during SplitBam and BaseCellCounter. That is cross-patient
+#      merging, and no downstream relabelling can undo it.
+#
+# Measured here: 13 colliding barcodes, 26 of 99,341 beads (0.03%), none
+# carrying a called variant. Immaterial on this pilot. It will not stay
+# immaterial at full depth with more beads and more calls.
+#
+# HYPHEN_FREE_CB writes the CB and the meta Index as
+#     "TATATGATTCTCGT.1_Puck_211214_29"
+# which survives split("-")[0] intact: no truncation, no pooling. Step05c
+# converts the dot back to a hyphen to recover the obs_name, and still
+# handles the legacy hyphenated form, so both work.
+#
+# Takes effect only on a full Step05a + Step05b rerun. There is no reason
+# to redo 3 hours of counting for 26 beads on the current data.
+HYPHEN_FREE_CB = True
+
+
+def to_cb(obs_name):
+    """h5ad obs_name -> the CB written into the BAM and the meta Index."""
+    return obs_name.replace("-", ".") if HYPHEN_FREE_CB else obs_name
+
 # --- Read filters -------------------------------------------------------
 MIN_MAPQ      = 255    # STAR unique. Verified: MAPQ255 count == NH==1 count.
 MAX_NM        = 5      # SComatic --max_nM default, applied here on NM
@@ -264,8 +297,7 @@ def retag_puck(task):
         if name not in beads:
             s["not_annotated"] += 1
             continue
-
-        r.set_tag("CB", name, value_type="Z")
+        r.set_tag("CB", to_cb(name), value_type="Z")
         r.set_tag("nM", int(nm), value_type="i")
         out.write(r)
         s["kept"] += 1
@@ -303,7 +335,10 @@ def write_meta_files(obs):
             lambda v: sanitize(v) if v in keep else COLLAPSE_LABEL)
 
         path = f"{OUTDIR}/meta_{col}.tsv"
-        pd.DataFrame({"Index": obs.index, "Cell_type": labels.values}).to_csv(
+        # Index must match the BAM CB byte for byte, so it goes through the
+        # same to_cb() transform. Recover the obs_name with .replace(".","-").
+        pd.DataFrame({"Index": [to_cb(i) for i in obs.index],
+                      "Cell_type": labels.values}).to_csv(
             path, sep="\t", index=False)
         maps[col] = dict(zip(obs.index, labels.values))
 
@@ -343,6 +378,10 @@ def main():
             sys.exit(f"FATAL: column '{c}' not in adata.obs")
 
     beads = set(obs.index)
+    cb_beads = {to_cb(b) for b in beads}
+    if HYPHEN_FREE_CB:
+        log("  CB format: hyphen-free "
+            f"(e.g. {to_cb(obs.index[0])}) so SComatic cannot truncate it")
     for puck in PUCK_DIRS:
         n = int((obs["puck_id"] == puck).sum())
         log(f"  {puck}: {n:,} annotated beads")
@@ -454,7 +493,7 @@ def main():
             break
         if r.has_tag("CB"):
             n_cb += 1
-            if r.get_tag("CB") not in beads:
+            if r.get_tag("CB") not in cb_beads:
                 n_bad += 1
         if r.has_tag("nM"):
             n_nm += 1
