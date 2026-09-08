@@ -45,7 +45,7 @@ conda activate slide-TCR-seq
 #===============================================================================
 
 PROJECT_ROOT="/master/jlehle/WORKING/slide-TCR-seq-working"
-SCRIPT_DIR="${PROJECT_ROOT}/scripts/TX_BIOMED"
+SCRIPT_DIR="${PROJECT_ROOT}/scripts/HNSCC_slide-TCR-seq/scripts/TX_BIOMED"
 PY_SCRIPT="${SCRIPT_DIR}/Step05a_Retag_MatchedBAM_For_SComatic.py"
 
 INPUTS="${PROJECT_ROOT}/data/inputs/fastq"
