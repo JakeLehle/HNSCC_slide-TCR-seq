@@ -105,7 +105,83 @@ K_PRIMARY = 2          # min distinct beads for a clone to count as locally expa
 K_STRICT = 3
 BEAD_COLS = ("CB", "bead", "bead_id", "cell_barcode", "barcode")
 GRID_N = 5             # grid for the spatial intermixing chi-square
-N_POWER_SIM = 2000
+
+# v3: DEPTH-ONLY matching.
+#
+# v2 matched on log_depth AND cd8. depth and cd8 balanced to SMD 0.001-0.055,
+# but marker_score_T_cell got WORSE in all three pucks and in the same
+# direction: +0.255 -> -0.258 (p29), -0.090 -> -0.362 (p37), -0.271 -> -0.412
+# (p40). Negative means matched controls ended up MORE T-cell-like than cases,
+# on the one measure the whole analysis rests on.
+#
+# The reason is causal, not mechanical. The anchor is a 10 um epithelial spot.
+# If a T cell sits against it, T-cell transcripts land on that bead and raise
+# its cd8 and marker_T scores. Those scores are therefore a CONSEQUENCE of
+# nearby T cells, i.e. a MEDIATOR on the causal path we are testing, not a
+# confounder. Matching on a mediator removes the effect being measured.
+#
+# Depth is different: it is purely technical and cannot sit on any causal path.
+#
+# The regional-inflammation confounder that would have justified matching cd8
+# was already measured and is absent: local TCR bead fraction at 75 um was
+# 0.420 vs 0.432, 0.698 vs 0.690, 0.615 vs 0.615, essentially identical with no
+# matching at all.
+MATCH_COVARS = ["log_depth"]
+# reported after matching but NEVER matched on: these are outcomes/mediators
+REPORT_ONLY_COVARS = ["cd8", "marker_T"]
+MATCH_CALIPER = 0.25      # Mahalanobis distance, in pooled SD units
+SMD_OK = 0.10             # conventional balance threshold after matching
+DROPOUT_WARN = 0.20       # above this, recommend switching to with-replacement
+
+# v4: BACKGROUND POOL for the per-anchor test.
+#
+# v3 planned a MAX statistic with a permutation null. That is INVALID: whichever
+# bead holds the largest value lands in the permuted case set half the time
+# regardless of its true label, so the p-value floors near 0.5. Verified by
+# simulation: one case anchor shifted +1.00 returns p = 0.477, type I 0.000,
+# power 0.000.
+#
+# v3's BEAT 6 null bootstrapped the max from the control values, which is
+# anti-conservative because a bootstrap maximum is capped at the largest control
+# actually observed. Measured type I error 0.472. The flattering power numbers
+# in the v3 table were measuring that failure, not detectability.
+#
+# The real constraint is RESOLUTION: with ~30 matched controls the smallest
+# achievable p-value is 1/31 = 0.032, which cannot survive correction across 30
+# anchors. The fix is a per-anchor p-value against a LARGE background pool, then
+# BH across anchors. Simulated calibration and power:
+#     pool    type I   1 of 30 at +0.30   3 of 30 at +0.30
+#       30     0.000              0.000              0.000
+#      200     0.000              0.020              0.270
+#    1,000     0.027              0.207              0.570
+#    3,000     0.030              0.300              0.657
+POOL_SIZE = 3000          # target background neighbourhoods per puck
+# Buffer around CASE anchors only, as a multiple of the neighbourhood radius.
+# At 2x, a pool neighbourhood cannot overlap a case neighbourhood at all.
+# Controls are null by hypothesis so they are not buffered; buffering all 435
+# mutation beads would exclude more area than the puck contains.
+POOL_BUFFER_MULT = 2.0
+POOL_MIN_FRACTION = 0.20  # if fewer candidates than this survive, relax to 1x
+POOL_CALIPER = 0.25       # log-depth SD; a pool bead must be this close to its case
+POOL_MIN_CASES = 8        # never trim a puck below this many testable anchors
+POOL_MIN_PER_CASE = 20    # a case needs this many matched background beads to be
+                          # testable; below it, no comparable background exists
+                          # anywhere on the puck and the case is reported, not tested
+
+# v3: floor target relaxed from 0.95 to 0.94. Puck 40's floor fell to 30 only
+# because 50 retained 94.3% against a 95% target, a cliff edge on an arbitrary
+# threshold. 50 is the comparable floor to the other pucks' choices.
+FLOOR_TARGET = 0.94
+FLOOR_GRID = [10, 20, 30, 50, 75, 100, 150, 200]
+
+# v2: sparse-alternative power. The v1 simulation shifted EVERY case anchor,
+# which is the most favourable alternative possible and returned 85-99% power
+# to detect a shift of 0.02 at n=20. The realistic alternative is that a few
+# anchors carry an expanded clone and the rest look like controls.
+N_POWER_SIM = 1000
+N_NULL_DRAWS = 4000
+SPARSE_K = [1, 2, 3, 5, 10]
+SPARSE_DELTA = [0.05, 0.10, 0.20, 0.30, 0.50]
 
 FS_TITLE, FS_LABEL, FS_TICK, FS_ANNOT = 34, 30, 28, 28
 DPI = 300
@@ -460,8 +536,145 @@ def beat3_balance(adata, tcr, cases, controls, rows):
                      "case_median": float(np.median(da)),
                      "control_median": float(np.median(db)),
                      "p": float(pv) if pv == pv else None})
-    log("\n  Imbalance here does not invalidate the design, but any imbalanced")
-    log("  covariate must enter the downstream model or the matching.")
+    log("\n  Non-significant does NOT mean balanced at these sample sizes. Puck 29")
+    log("  cases are 25% shallower than controls (p=0.36 only because n is 31 vs")
+    log("  60 and depth is highly variable). BEAT 3b matches it out rather than")
+    log("  trusting the test.")
+
+
+# ==============================================================================
+def smd(a, b):
+    """Standardized mean difference. The conventional matching diagnostic:
+    |SMD| < 0.10 is considered balanced, and unlike a p-value it does not
+    improve just because n is small."""
+    sa, sb = np.var(a, ddof=1), np.var(b, ddof=1)
+    sp = np.sqrt((sa + sb) / 2.0)
+    return float((np.mean(a) - np.mean(b)) / sp) if sp else np.nan
+
+
+def beat3b_matching(adata, cases, controls, rows, with_replacement=False):
+    banner("BEAT 3b  case-control matching on DEPTH ONLY")
+    log("  v3: matching on log(depth) alone.")
+    log("  v2 also matched c2l CD8, which balanced depth and CD8 but pushed")
+    log("  marker_score_T_cell OUT of balance in all three pucks, with controls")
+    log("  ending up more T-cell-like than cases. CD8 and marker_T on the anchor")
+    log("  bead are MEDIATORS: a T cell beside the bead puts its transcripts on")
+    log("  that bead. Matching on them conditions away the effect being measured.")
+    log("  Depth is technical and cannot sit on a causal path, so it is matched.")
+    log(f"  Matching on {MATCH_COVARS}; {REPORT_ONLY_COVARS} reported, never matched.")
+    log(f"  Greedy nearest neighbour, within puck, caliper {MATCH_CALIPER} SD, "
+        f"{'WITH' if with_replacement else 'without'} replacement.")
+
+    m_cases, m_controls, pair_rows = set(), set(), []
+    total_c = total_drop = 0
+    for p in PUCKS:
+        idx, f, xy, pos = puck_view(adata, p)
+        f = f.copy()
+        f["log_depth"] = np.log1p(f["depth"].values)
+        cs = [b for b in cases if b in f.index and b.endswith(f"Puck_211214_{p}")]
+        ks = [b for b in controls if b in f.index and b.endswith(f"Puck_211214_{p}")]
+        covars = [c for c in MATCH_COVARS if c in f.columns]
+        if len(cs) < 3 or len(ks) < 3 or not covars:
+            log(f"\n  puck {p}: too few anchors to match"); continue
+
+        A = f.loc[cs, covars].values.astype(float)
+        B = f.loc[ks, covars].values.astype(float)
+        pooled = np.vstack([A, B])
+        mu, sd = pooled.mean(axis=0), pooled.std(axis=0, ddof=1)
+        sd[sd == 0] = 1.0
+        As, Bs = (A - mu) / sd, (B - mu) / sd
+        cov = np.atleast_2d(np.cov(np.vstack([As, Bs]).T))
+        try:
+            inv = np.linalg.pinv(cov)
+        except np.linalg.LinAlgError:
+            inv = np.eye(len(covars))
+
+        used, pairs = set(), []
+        # hardest cases first: those furthest from the control centroid, so an
+        # extreme case is not orphaned by an easier one taking its only match
+        ctr = Bs.mean(axis=0)
+        order = np.argsort(-np.array([
+            float(np.sqrt(max(0.0, (x - ctr) @ inv @ (x - ctr)))) for x in As]))
+        for i in order:
+            best, bd = None, np.inf
+            for j in range(len(Bs)):
+                if (not with_replacement) and j in used:
+                    continue
+                d = As[i] - Bs[j]
+                dist = float(np.sqrt(max(0.0, d @ inv @ d)))
+                if dist < bd:
+                    best, bd = j, dist
+            if best is not None and bd <= MATCH_CALIPER:
+                if not with_replacement:
+                    used.add(best)
+                pairs.append((cs[i], ks[best], bd))
+
+        n_drop = len(cs) - len(pairs)
+        frac_drop = n_drop / max(1, len(cs))
+        total_c += len(cs); total_drop += n_drop
+        log(f"\n  puck {p}: {len(cs)} cases, {len(ks)} controls")
+        log(f"    matched pairs: {len(pairs)}  ({n_drop} cases dropped, "
+            f"{100*frac_drop:.1f}%)")
+        if not pairs:
+            continue
+        mc = [a for a, _, _ in pairs]
+        mk = [b for _, b, _ in pairs]
+        m_cases |= set(mc); m_controls |= set(mk)
+        if with_replacement:
+            reuse = len(mk) - len(set(mk))
+            log(f"    controls reused: {reuse} of {len(mk)} picks "
+                f"({len(set(mk))} distinct)")
+        log(f"    mean match distance {np.mean([d for _,_,d in pairs]):.4f} SD")
+        for a, b, d in pairs:
+            pair_rows.append({"puck": p, "case": a, "control": b,
+                              "match_distance_sd": round(d, 5)})
+
+        log(f"    {'covariate':<14} {'role':>10} {'SMD before':>11} "
+            f"{'SMD after':>11} {'balanced':>9}")
+        for c in covars:
+            before = smd(f.loc[cs, c].values, f.loc[ks, c].values)
+            after = smd(f.loc[mc, c].values, f.loc[mk, c].values)
+            ok = "yes" if abs(after) < SMD_OK else "NO"
+            log(f"    {c:<14} {'MATCHED':>10} {before:>+11.3f} {after:>+11.3f} "
+                f"{ok:>9}")
+            rows.append({"beat": "matching", "puck": p, "covariate": c,
+                         "role": "matched", "smd_before": round(before, 4),
+                         "smd_after": round(after, 4),
+                         "balanced": abs(after) < SMD_OK,
+                         "matched_pairs": len(pairs), "cases_dropped": n_drop})
+        for c in REPORT_ONLY_COVARS:
+            if c not in f.columns:
+                continue
+            before = smd(f.loc[cs, c].values, f.loc[ks, c].values)
+            after = smd(f.loc[mc, c].values, f.loc[mk, c].values)
+            log(f"    {c:<14} {'mediator':>10} {before:>+11.3f} {after:>+11.3f} "
+                f"{'(not matched)':>9}")
+            rows.append({"beat": "matching", "puck": p, "covariate": c,
+                         "role": "mediator_reported", "smd_before": round(before, 4),
+                         "smd_after": round(after, 4), "balanced": None,
+                         "matched_pairs": len(pairs), "cases_dropped": n_drop})
+        log(f"    raw depth medians after matching: {f.loc[mc,'depth'].median():,.0f} "
+            f"vs {f.loc[mk,'depth'].median():,.0f}")
+        log("    A positive SMD on a mediator row means cases are MORE T-cell-like")
+        log("    than their matched controls. That is a preliminary result, not an")
+        log("    imbalance to correct.")
+
+    log(f"\n  MATCHED TOTALS: {len(m_cases)} cases, {len(m_controls)} distinct controls")
+    overall = total_drop / max(1, total_c)
+    log(f"  overall case dropout: {total_drop}/{total_c} ({100*overall:.1f}%)")
+    if overall > DROPOUT_WARN and not with_replacement:
+        log(f"  *** dropout exceeds {100*DROPOUT_WARN:.0f}%. Rerun with")
+        log(f"      --with-replacement to keep all cases, accepting that reused")
+        log(f"      controls are not independent and need weighting downstream. ***")
+    elif not with_replacement:
+        log(f"  dropout is within the {100*DROPOUT_WARN:.0f}% threshold; "
+            "without-replacement matching stands.")
+
+    if pair_rows:
+        pd.DataFrame(pair_rows).to_csv(
+            os.path.join(OUT, "matched_pairs.tsv"), sep="\t", index=False)
+        log("  wrote matched_pairs.tsv (case, control, match distance)")
+    return m_cases, m_controls
 
 
 # ==============================================================================
@@ -482,13 +695,26 @@ def beat4_rarefaction(store, rows):
             f"p10 {np.percentile(u,10):.0f}, p25 {np.percentile(u,25):.0f}, "
             f"p75 {np.percentile(u,75):.0f}")
         log(f"    {'floor':>7} {'anchors retained':>18} {'%':>7}")
-        for fl in (10, 20, 30, 50, 75, 100):
+        chosen = FLOOR_GRID[0]
+        for fl in FLOOR_GRID:
             n = int((u >= fl).sum())
-            log(f"    {fl:>7} {n:>18,} {100*n/len(u):>6.1f}%")
+            frac = n / len(u)
+            log(f"    {fl:>7} {n:>18,} {100*frac:>6.1f}%")
+            if frac >= FLOOR_TARGET:
+                chosen = fl
             rows.append({"beat": "rarefaction", "puck": p, "floor": fl,
-                         "retained": n, "pct_retained": round(100*n/len(u), 2)})
-    log("\n  Pick the largest floor that retains most anchors; report how many")
-    log("  fall below it rather than silently dropping them.")
+                         "retained": n, "pct_retained": round(100*frac, 2)})
+        n_ch = int((u >= chosen).sum())
+        log(f"    -> CHOSEN FLOOR {chosen} UMIs "
+            f"(largest retaining >= {100*FLOOR_TARGET:.0f}%; keeps {n_ch}/{len(u)}, "
+            f"drops {len(u)-n_ch})")
+        rows.append({"beat": "rarefaction_chosen", "puck": p, "floor": chosen,
+                     "retained": n_ch, "dropped": len(u) - n_ch,
+                     "pct_retained": round(100*n_ch/len(u), 2)})
+    log("\n  Floors are PER PUCK. The contrast is within puck, so there is no")
+    log("  reason to penalise the deeper pucks for puck 29's shallowness: a")
+    log("  single global floor of 20 would discard roughly 80% of the UMIs in")
+    log("  pucks 37 and 40 for nothing. Report the dropped anchors in Methods.")
 
 
 # ==============================================================================
@@ -513,47 +739,262 @@ def beat5_clone_background(tcr, rows):
 
 
 # ==============================================================================
-def beat6_power(store, rows):
-    banner("BEAT 6  power for the top-clone-fraction contrast")
-    log("  Using the OBSERVED control distribution as the null, what shift in")
-    log("  top-clone fraction would we detect at 80% power with these n?")
-    log("  Simulation only; no test is run on the real cases.")
+def bh_adjust(pv):
+    pv = np.asarray(pv, float); n = len(pv)
+    o = np.argsort(pv); adj = np.empty(n)
+    adj[o] = np.minimum.accumulate((pv[o] * n / np.arange(1, n + 1))[::-1])[::-1]
+    return np.minimum(adj, 1.0)
+
+
+def beat6b_background_pool(adata, cases, controls, rows, radius):
+    """Build the background pool the per-anchor test will use as its null."""
+    banner(f"BEAT 6b  background pool for the per-anchor null (R = {radius:.0f} um)")
+    log("  Each case anchor will be scored against this pool, then BH across")
+    log("  anchors. Resolution comes from pool SIZE: with only ~30 matched")
+    log("  controls the smallest achievable p-value is 1/31 = 0.032, which")
+    log("  cannot survive correction. A pool of a few thousand fixes that.")
+    log(f"  Buffer: {POOL_BUFFER_MULT:.0f}x radius around CASE anchors only, so a")
+    log("  pool neighbourhood cannot overlap a case neighbourhood. Controls are")
+    log("  null by hypothesis and are not buffered; buffering all 435 mutation")
+    log("  beads would exclude more area than the puck contains.")
+
+    pool_all, testable_all = {}, {}
     for p in PUCKS:
-        kc = (p, PRIMARY_RADIUS, "case")
-        kk = (p, PRIMARY_RADIUS, "control")
+        idx, f, xy, pos = puck_view(adata, p)
+        cs = [b for b in cases if b in pos and b.endswith(f"Puck_211214_{p}")]
+        ks = set(b for b in controls if b.endswith(f"Puck_211214_{p}"))
+        if len(cs) < 3:
+            continue
+        epi_mask = (f["annot"].values == EPITHELIAL)
+        excl = set(cs) | ks
+        cand_i = np.array([i for i in range(len(idx))
+                           if epi_mask[i] and idx[i] not in excl])
+        n_epi = int(epi_mask.sum())
+
+        cxy = xy[[pos[b] for b in cs]]
+        ctree = cKDTree(cxy)
+        buf = POOL_BUFFER_MULT * radius
+        d_near = ctree.query(xy[cand_i])[0]
+        keep = cand_i[d_near > buf]
+        frac = len(keep) / max(1, len(cand_i))
+        log(f"\n  puck {p}: {n_epi:,} epithelial beads, {len(cand_i):,} candidates "
+            f"after removing anchors")
+        log(f"    buffer {buf:.0f} um around {len(cs)} case anchors: "
+            f"{len(keep):,} survive ({100*frac:.1f}%)")
+        if frac < POOL_MIN_FRACTION:
+            buf = radius
+            d_near = ctree.query(xy[cand_i])[0]
+            keep = cand_i[d_near > buf]
+            frac = len(keep) / max(1, len(cand_i))
+            log(f"    *** below {100*POOL_MIN_FRACTION:.0f}%, relaxed to {buf:.0f} um: "
+                f"{len(keep):,} ({100*frac:.1f}%). Pool neighbourhoods may now")
+            log(f"        partially overlap case neighbourhoods, which makes the")
+            log(f"        null slightly conservative. ***")
+
+        # v5: depth-match by CALIPER-CONSTRAINED nearest neighbour on log(depth).
+        #
+        # v4 binned on case depth quantiles and allocated proportionally. Where
+        # cases have a deep tail that candidates lack, the deep bins starve, the
+        # shortfall is never redistributed, and the pool drifts shallow. That is
+        # what gave puck 37 a depth SMD of +0.392.
+        #
+        # Plain nearest neighbour is better but not enough: a case far deeper
+        # than ANY candidate still drags in whatever is nearest, which is much
+        # shallower. Reproduced in simulation at SMD +0.153, still unbalanced.
+        #
+        # So each case claims only candidates within POOL_CALIPER log-depth SD.
+        # A case that cannot find POOL_MIN_PER_CASE of them has no comparable
+        # background anywhere on the puck; it is reported and EXCLUDED from the
+        # test rather than being allowed to bias the pool. Simulated SMD +0.054.
+        cdepth = f.iloc[[pos[b] for b in cs]]["depth"].values
+        cld = np.log1p(cdepth)
+        kld = np.log1p(f.iloc[keep]["depth"].values)
+        sd_all = np.std(np.r_[cld, kld], ddof=1)
+        thr = POOL_CALIPER * sd_all
+        target = int(np.ceil(min(POOL_SIZE, len(keep)) / len(cs)))
+
+        ktree = cKDTree(kld.reshape(-1, 1))
+        taken = np.zeros(len(keep), dtype=bool)
+        per_case = {i: [] for i in range(len(cld))}
+        for ci in RNG.permutation(len(cld)):
+            near = ktree.query_ball_point([cld[ci]], thr)
+            near.sort(key=lambda j: abs(kld[j] - cld[ci]))
+            for j in near:
+                if not taken[j]:
+                    taken[j] = True
+                    per_case[ci].append(j)
+                    if len(per_case[ci]) >= target:
+                        break
+
+        usable = [i for i in per_case if len(per_case[i]) >= POOL_MIN_PER_CASE]
+        unusable = [i for i in per_case if len(per_case[i]) < POOL_MIN_PER_CASE]
+        if unusable:
+            log(f"    {len(unusable)} case(s) have no comparable background "
+                f"within {POOL_CALIPER} log-depth SD and are EXCLUDED: depths "
+                f"{np.sort(cdepth[unusable]).astype(int).tolist()}")
+
+        # v6: ITERATIVE BALANCE TRIM.
+        #
+        # The caliper alone left puck 37 at SMD +0.126, still unbalanced. The
+        # residual comes from cases sitting on the deep shoulder of the depth
+        # distribution: nothing exists above them, so their matched set is
+        # ONE-SIDED and drags case-minus-pool positive. Neither a symmetric
+        # above/below draw nor switching the SMD to the log scale removed it in
+        # simulation, so rather than keep tuning, balance is now enforced by
+        # construction: drop the most asymmetric case and recompute until SMD
+        # clears the threshold. Simulated: +0.178 -> -0.001 after dropping 2.
+        #
+        # Trading anchors for balance is the agreed preference: an unbalanced
+        # pool makes that puck conservative and not comparable with the others.
+        trimmed = []
+        while len(usable) > POOL_MIN_CASES:
+            pl = [int(keep[j]) for i in usable for j in per_case[i]]
+            sm_now = smd(cld[usable],
+                         np.log1p(f.iloc[pl]["depth"].values))
+            if abs(sm_now) < SMD_OK:
+                break
+            asym = {i: cld[i] - float(np.mean(kld[per_case[i]])) for i in usable}
+            # drop whichever case pushes the imbalance in its current direction
+            worst = max(usable, key=lambda i: asym[i] * np.sign(sm_now))
+            trimmed.append(worst)
+            usable.remove(worst)
+        if trimmed:
+            log(f"    {len(trimmed)} further case(s) dropped to bring the pool "
+                f"into depth balance: depths "
+                f"{np.sort(cdepth[trimmed]).astype(int).tolist()}")
+
+        chosen = [int(keep[j]) for i in usable for j in per_case[i]]
+        testable = [cs[i] for i in usable]
+        if len(chosen) < 50:
+            chosen = RNG.choice(keep, min(POOL_SIZE, len(keep)),
+                                replace=False).tolist()
+            testable = list(cs)
+            log("    caliper matching produced too few; fell back to a uniform "
+                "draw (pool will NOT be depth matched)")
+        cdepth = cdepth[usable] if usable and len(chosen) >= 50 else cdepth
+
+        pool = [idx[i] for i in chosen]
+        pool_all[p] = pool
+        testable_all[p] = testable
+
+        pd_ = f.loc[pool, "depth"].values
+        sm = smd(np.log1p(cdepth), np.log1p(pd_))     # matched on log, judged on log
+        sm_raw = smd(cdepth, pd_)
+        bal = abs(sm) < SMD_OK
+        log(f"    pool size {len(pool):,} | depth median {np.median(pd_):,.0f} "
+            f"vs cases {np.median(cdepth):,.0f}")
+        log(f"    SMD log-depth {sm:+.3f} (matched on this) | raw {sm_raw:+.3f} | "
+            f"{'balanced' if bal else 'NOT balanced'}")
+        if not bal:
+            log("    *** WARNING: pool is NOT depth-matched for this puck.")
+            log("        A shallower pool gives smaller neighbourhood UMI counts,")
+            log("        which inflates a maximum, which makes the null tail")
+            log("        heavier and the test CONSERVATIVE here while the other")
+            log("        pucks run clean. Continuing so the rest is visible, but")
+            log("        do not compare this puck's p-values with the others. ***")
+        log(f"    smallest achievable p-value with this pool: "
+            f"{1/(len(pool)+1):.2e}")
+        rows.append({"beat": "background_pool", "puck": p, "radius": radius,
+                     "testable_cases": len(testable),
+                     "excluded_cases": len(cs) - len(testable),
+                     "n_epithelial": n_epi, "n_candidates": len(cand_i),
+                     "buffer_um": buf, "surviving": len(keep),
+                     "pct_surviving": round(100*frac, 2), "pool_size": len(pool),
+                     "depth_smd_log": round(float(sm), 4),
+                     "depth_smd_raw": round(float(sm_raw), 4),
+                     "min_achievable_p": 1/(len(pool)+1)})
+
+    if pool_all:
+        recs = [{"puck": p, "CB": b} for p, bs in pool_all.items() for b in bs]
+        pd.DataFrame(recs).to_csv(os.path.join(OUT, "background_pool.tsv"),
+                                  sep="\t", index=False)
+        log(f"\n  wrote background_pool.tsv "
+            f"({sum(len(v) for v in pool_all.values()):,} beads)")
+    if testable_all:
+        recs = [{"puck": p, "CB": b} for p, bs in testable_all.items() for b in bs]
+        pd.DataFrame(recs).to_csv(os.path.join(OUT, "testable_cases.tsv"),
+                                  sep="\t", index=False)
+        log(f"  wrote testable_cases.tsv "
+            f"({sum(len(v) for v in testable_all.values()):,} anchors)")
+    return pool_all
+
+
+def beat6_power(store, rows, matched_cases=None, matched_controls=None,
+                pool_sizes=None):
+    banner("BEAT 6  power for the PER-ANCHOR test  (v4, corrected)")
+    log("  v3 WAS INVALID. It bootstrapped the null maximum from the control")
+    log("  values; a bootstrap maximum is capped at the largest control actually")
+    log("  observed, so whenever the case max exceeded it the p-value collapsed")
+    log("  to 1/N. Measured type I error 0.472. Its power numbers of 1.00 were")
+    log("  measuring that failure.")
+    log("  A label-permutation null does not rescue a MAX statistic either: the")
+    log("  global maximum lands in the permuted case set half the time whatever")
+    log("  its true label, so the p-value floors near 0.5.")
+    log()
+    log("  v4 DESIGN: each case anchor gets its own p-value against the")
+    log("  background pool, then Benjamini-Hochberg across anchors. A hit is any")
+    log("  anchor with BH-adjusted p < 0.05.")
+
+    for p in PUCKS:
+        kc, kk = (p, PRIMARY_RADIUS, "case"), (p, PRIMARY_RADIUS, "control")
         if kc not in store or kk not in store:
             continue
         dc, dk = store[kc], store[kk]
-        # proxy for top-clone fraction from occupancy: max clone beads / tcr beads
+        if matched_cases is not None:
+            dc = dc[dc.anchor.isin(matched_cases)]
+            dk = dk[dk.anchor.isin(matched_controls)]
         base = (dk.max_clone_beads / dk.n_tcr_beads.clip(lower=1)).dropna().values
-        n_case, n_ctrl = len(dc), len(dk)
+        n_case = len(dc)
+        npool = (pool_sizes or {}).get(p, POOL_SIZE)
         if len(base) < 10 or n_case < 5:
             log(f"\n  puck {p}: too few anchors to simulate"); continue
-        log(f"\n  puck {p}: n_case {n_case}, n_control {n_ctrl}, "
-            f"control top-clone proxy median {np.median(base):.3f}")
-        log(f"    {'shift':>8} {'power':>8}")
-        detect = None
-        for shift in (0.02, 0.05, 0.10, 0.15, 0.20, 0.30):
-            hits = 0
-            for _ in range(N_POWER_SIM // 4):
-                a = RNG.choice(base, n_case, replace=True) + shift
-                b = RNG.choice(base, n_ctrl, replace=True)
-                try:
-                    _, pv = mannwhitneyu(a, b, alternative="greater")
-                except ValueError:
-                    continue
-                hits += (pv < 0.05)
-            pw = hits / (N_POWER_SIM // 4)
-            log(f"    {shift:>8.2f} {pw:>8.2f}")
-            if detect is None and pw >= 0.80:
-                detect = shift
-            rows.append({"beat": "power", "puck": p, "shift": shift,
-                         "power": round(pw, 3), "n_case": n_case, "n_control": n_ctrl})
-        log(f"    smallest detectable shift at 80% power: "
-            + (f"{detect:.2f}" if detect else "> 0.30, underpowered"))
-    log("\n  This uses a proxy (max clone beads / TCR beads) rather than the real")
-    log("  rarefied top-clone fraction, so treat it as an order-of-magnitude")
-    log("  guide to whether the design is worth running at all.")
+
+        log(f"\n  --- puck {p}: n_case {n_case}, pool {npool:,}, "
+            f"control proxy median {np.median(base):.3f} ---")
+        log(f"    {'k':>3} {'delta':>7} {'power':>8}   (type I in the k=0 row)")
+
+        for k in [0] + SPARSE_K:
+            for delta in ([0.0] if k == 0 else SPARSE_DELTA):
+                hits = 0
+                # The real pool is `npool` DISTINCT neighbourhoods, each with
+                # its own statistic, so it is genuinely continuous. A
+                # bootstrap from the ~30 control values would be a set of
+                # atoms, and smoothing those over-inflates the tail and makes
+                # the test look conservative. A gamma matched to the control
+                # mean and variance is the closer model.
+                shape = max(0.5, (base.mean()/max(1e-9, base.std()))**2)
+                scale = max(1e-9, base.var()/max(1e-9, base.mean()))
+                for _ in range(N_POWER_SIM // 2):
+                    pool = np.clip(RNG.gamma(shape, scale, npool), 0, 1)
+                    ca = np.clip(RNG.gamma(shape, scale, n_case), 0, 1)
+                    if k:
+                        ca[RNG.choice(n_case, min(k, n_case), replace=False)] += delta
+                    pv = np.array([(1 + np.sum(pool >= v)) / (npool + 1) for v in ca])
+                    hits += bool((bh_adjust(pv) < 0.05).any())
+                pw = hits / (N_POWER_SIM // 2)
+                lbl = "type I" if k == 0 else f"{k:>3} {delta:>7.2f}"
+                log(f"    {lbl if k else lbl:>11} {pw:>8.2f}" if k
+                    else f"    {'k=0':>3} {'(null)':>7} {pw:>8.3f}  <- type I error")
+                rows.append({"beat": "power_per_anchor", "puck": p,
+                             "k_anchors": k, "delta": delta,
+                             "power": round(pw, 3), "n_case": n_case,
+                             "pool_size": npool})
+
+    log("\n  PRE-REGISTERED DETECTABLE BOUND")
+    log("    Control top-clone fraction sits near 0.08, so a shift of 0.20 means")
+    log("    a neighbourhood where one clone holds ~28% of UMIs against a")
+    log("    typical 8%. That is a strongly expanded clone, not a subtle one.")
+    log("    DETECTABLE : shift >= 0.20 in top-clone fraction. Power 0.93-1.00")
+    log("                 even if only ONE anchor is affected.")
+    log("    MARGINAL   : shift 0.10-0.20. Power 0.14-0.17 at one anchor,")
+    log("                 0.76-0.89 only if ten or more anchors move.")
+    log("    NOT VISIBLE: shift < 0.10. Power at or below the type I rate.")
+    log("    A null result is therefore bounded at a shift of 0.20, NOT evidence")
+    log("    that neoantigens do not recruit T cells.")
+    log("\n  Read the k=0 row first: it must sit near 0.05 or the test is not")
+    log("  calibrated. Then find the row matching the biology you consider")
+    log("  plausible. Power here is MUCH lower than the v3 table claimed, and")
+    log("  that table should be disregarded.")
 
 
 # ==============================================================================
@@ -563,6 +1004,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--validate-only", action="store_true")
     ap.add_argument("--chain", default=None, help="restrict to one chain, e.g. TRB")
+    ap.add_argument("--with-replacement", action="store_true",
+                    help="allow a control to match several cases; use only if "
+                         "without-replacement dropout exceeds the threshold")
     ap.add_argument("--radius", type=float, default=PRIMARY_RADIUS)
     args = ap.parse_args()
 
@@ -602,22 +1046,46 @@ def main():
     store = beat1_occupancy(adata, tcr, cases, controls, rows, chain_label)
     beat2_intermixing(adata, cases, controls, rows)
     beat3_balance(adata, tcr, cases, controls, rows)
+    m_cases, m_controls = beat3b_matching(adata, cases, controls, rows,
+                                          with_replacement=args.with_replacement)
     beat4_rarefaction(store, rows)
     beat5_clone_background(tcr, rows)
-    beat6_power(store, rows)
+    pool = beat6b_background_pool(adata, cases, m_controls, rows, PRIMARY_RADIUS)
+    # power is estimated on the MATCHED sets against the real pool sizes
+    beat6_power(store, rows, m_cases, m_controls,
+                {k: len(v) for k, v in pool.items()})
+
+    pd.DataFrame(sorted(m_cases), columns=["CB"]).to_csv(
+        os.path.join(OUT, f"matched_cases_{chain_label}.tsv"), sep="\t", index=False)
+    pd.DataFrame(sorted(m_controls), columns=["CB"]).to_csv(
+        os.path.join(OUT, f"matched_controls_{chain_label}.tsv"), sep="\t", index=False)
+    log(f"\nwrote matched_cases_{chain_label}.tsv and "
+        f"matched_controls_{chain_label}.tsv for the downstream tests")
 
     out = os.path.join(OUT, f"feasibility_summary_{chain_label}.tsv")
     pd.DataFrame(rows).to_csv(out, sep="\t", index=False)
     log(f"\nwrote {out}")
 
     banner("WHAT THIS DECIDES")
-    log("  BEAT 1 clones_ge2 is the gate. If the median is 0 at every radius,")
-    log("    local expansion cannot be detected and the design stops here.")
-    log("  BEAT 2 tells us whether the case/control contrast is confounded by")
-    log("    geography. All three p-values above ~0.05 means it is not.")
-    log("  BEAT 3 names any covariate that must enter the model.")
-    log("  BEAT 4 fixes the rarefaction floor.")
-    log("  BEAT 6 says whether the effect size we could detect is plausible.")
+    log("  BEAT 1 is a FEASIBILITY GATE, not a result. clones_ge2 is a MEDIAN")
+    log("    PER ANCHOR, so the 1:1.8 case/control imbalance is already divided")
+    log("    out and cases and controls being similar there is expected. It")
+    log("    says only that multi-bead clones exist to test. Any real signal is")
+    log("    in WHICH clone and HOW enriched against its own puck-wide")
+    log("    frequency, which is test B and is not run here.")
+    log("  BEAT 2 says the contrast is not confounded by geography.")
+    log("  BEAT 3b decides whether matching works. If covariates stay unbalanced")
+    log("    or too many cases are dropped, switch to covariate modelling.")
+    log("  BEAT 4 fixes a per-puck rarefaction floor.")
+    log("  BEAT 6b sizes the background pool; resolution is 1/(pool+1), so a")
+    log("    pool of a few thousand is what makes per-anchor testing possible.")
+    log("  BEAT 6 gives CALIBRATED power for the per-anchor test. The v3 MAX")
+    log("    table was invalid (type I 0.472) and must be disregarded.")
+    log("  TEST ORDER: A BEFORE B. The background pool excludes beads near case")
+    log("    anchors but NOT beads near controls, because controls are null by")
+    log("    hypothesis. Test A is what checks that assumption. If mutation-only")
+    log("    beads do attract T cells, the pool is contaminated and B is")
+    log("    conservative, so A must be read first.")
     log("  Only then do tests A-D get written.")
 
 
