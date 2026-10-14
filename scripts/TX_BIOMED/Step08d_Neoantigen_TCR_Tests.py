@@ -87,7 +87,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-from scipy.stats import mannwhitneyu, wilcoxon, norm, spearmanr
+from scipy.stats import mannwhitneyu, wilcoxon, norm, spearmanr, hypergeom, binomtest
 
 try:
     import anndata as ad
@@ -121,9 +121,13 @@ EPITHELIAL = "epithelial"
 # and pair attrition at R=75 hit 8 of 18 in puck 37 against the 94-95% BEAT 4
 # predicted. Reading the floors makes that mismatch structurally impossible.
 FLOORS_FALLBACK = {"29": 20, "37": 75, "40": 50}
-RADII = [100.0, 75.0]      # 100 um is PRIMARY: 75 um is floor-limited in every puck
+# v4: 75 um DROPPED. It lost 26 of 30 and 16 of 18 test-A pairs to the floor,
+# and both nominal D hits lived there while reversing at 100 um. Dropping it
+# restores the pairs we actually want and removes an arm that only ever produced
+# radius-specific results.
+RADII = [100.0]
 K_VALUES = [2, 3]
-N_RAREFY = 100
+N_RAREFY = 400   # v4: 100 moved p by 0.24 -> 0.30 between runs on noise alone
 
 # v2: a single pre-specified lambda. v1 combined three lambdas per puck with
 # Stouffer at n=9, treating three views of the same data on the same puck as
@@ -272,6 +276,32 @@ def build_index(tcr_p, idx_set):
     return out
 
 
+def hypergeom_stat(labels, cb, puck_umi, N_puck, k_req):
+    """v4. The ratio statistic has a CEILING: a clone wholly inside the
+    neighbourhood scores the same whether it has 5 UMIs or 50, which is how a
+    5-UMI clone topped the hit list. The hypergeometric asks how surprising the
+    containment is GIVEN the clone's size, separating those by ~30 orders of
+    magnitude. It also conditions on neighbourhood size analytically, so this is
+    computed on FULL counts with no rarefaction."""
+    if not len(labels):
+        return 0.0, None
+    n = len(labels)
+    vals, cnts = np.unique(labels, return_counts=True)
+    best, best_c = 1.0, None
+    for v, k in zip(vals, cnts):
+        if cb.get(v, 0) < k_req or k < MIN_LOCAL_UMI:
+            continue
+        K = puck_umi.get(v, 0)
+        if K < MIN_PUCK_UMI or K < k:
+            continue
+        pv = float(hypergeom.sf(k - 1, N_puck, K, n))
+        if pv < best:
+            best, best_c = pv, {"clone": int(v), "clone_umis_local": int(k),
+                                "clone_umis_puck": int(K), "p_hyper": pv,
+                                "clone_beads": int(cb.get(v, 0))}
+    return (-np.log10(max(best, 1e-300)) if best_c else 0.0), best_c
+
+
 def neighbourhood(tree, xy, idx, pos, bead_clones, anchor, radius):
     if anchor not in pos:
         return None, None
@@ -356,6 +386,10 @@ def score_anchors(anchors, tree, xy, idx, pos, bead_clones, floor, puck_freq,
         if labels is None:
             continue
         st = rarefied(labels, floor, puck_freq, puck_umi, cb, k_list)
+        if st is not None:
+            for kk in k_list:
+                hs, _ = hypergeom_stat(labels, cb, puck_umi, N_PUCK_CUR, kk)
+                st[f"hyper_k{kk}"] = hs
         if st is None:
             rows.append({"anchor": a, "below_floor": True,
                          "n_umi": 0 if labels is None else len(labels)})
@@ -450,12 +484,20 @@ def test_A(ct, kt, pairs_p, rows, p, R, chain):
         pm = np.nan
     log(f"      case median {np.median(ca):.4f} | control median {np.median(kb):.4f} "
         f"| diff {np.median(ca - kb):+.4f}")
+    npos = int((ca > kb).sum())
+    try:
+        ps = binomtest(npos, len(pairs_ok), 0.5, alternative="greater").pvalue
+    except Exception:
+        ps = np.nan
+    log(f"      pairs with case > control: {npos}/{len(pairs_ok)} "
+        f"({100*npos/len(pairs_ok):.0f}%), sign test p = {ps:.4g}")
     log(f"      paired Wilcoxon (PRIMARY) p = {pw:.4g} | Mann-Whitney p = {pm:.4g}")
     rows.append({"test": "A_clonality", "puck": p, "radius": R, "chain": chain,
                  "n_pairs": len(pairs_ok), "median_case": float(np.median(ca)),
                  "median_control": float(np.median(kb)),
                  "median_diff": float(np.median(ca - kb)),
-                 "p_wilcoxon": float(pw), "p_mwu": float(pm)})
+                 "p_wilcoxon": float(pw), "p_mwu": float(pm),
+                 "n_pairs_positive": npos, "p_sign": float(ps)})
     return {"p": float(pw), "ca": ca, "kb": kb}
 
 
@@ -543,63 +585,129 @@ def anchor_independence(cases, xy, pos, R, p, rows):
                  "overlapping_pairs": len(pairs), "effective_groups": clusters})
 
 
-def test_E_dose_response(ct, neo_info, xy, pos, cases, R, p, chain, rows):
-    """If the association is real it should SCALE with antigen strength, not
-    merely with presence. A binary case/control difference of 0.007 is easy to
-    dismiss; a monotone trend across predicted binding affinity is not.
-    Artifacts rarely produce dose-response."""
+def affinity_distribution(neo_info, rows):
+    """v4. Look at the affinity distribution BEFORE choosing any covariate, so
+    we do not swap one arbitrary threshold for another.
+
+    is_strong (IC50 < 50 nM) split 2/26, 1/16, 1/48 and worse: it never ran.
+    The field convention is 500 nM, and 50 nM is tenfold stronger than that.
+    Raw delta_ic50 is a DIFFERENCE on a scale that spans orders of magnitude.
+    Wild-type IC50 is recoverable as mut_ic50 + delta_ic50, so the natural
+    scale-free covariate is log2(wt / mut): binding gained relative to
+    wild type, continuous, no cutoff anywhere."""
+    banner("AFFINITY DISTRIBUTION  (before any covariate is chosen)")
+    d = neo_info.copy()
+    d["wt_ic50"] = d["mut_ic50"] + d["delta_ic50"]
+    d["log2_fold"] = np.log2(d["wt_ic50"] / d["mut_ic50"].clip(lower=1e-3))
+    for col, lab in (("mut_ic50", "mutant IC50 (nM)"),
+                     ("delta_ic50", "delta IC50 (nM)"),
+                     ("log2_fold", "log2(wt / mut) binding fold-change")):
+        v = d[col].dropna().values
+        if not len(v):
+            continue
+        q = np.percentile(v, [0, 10, 25, 50, 75, 90, 100])
+        log(f"  {lab}: n={len(v)}")
+        log("    " + "  ".join(f"p{p}={x:,.2f}" for p, x in
+                               zip([0, 10, 25, 50, 75, 90, 100], q)))
+        rows.append({"test": "affinity_distribution", "metric": col, "n": len(v),
+                     **{f"p{p}": float(x) for p, x in
+                        zip([0, 10, 25, 50, 75, 90, 100], q)}})
+    log(f"\n  conventional thresholds, for reference only:")
+    for thr in (50, 150, 500):
+        n = int((d["mut_ic50"] < thr).sum())
+        log(f"    IC50 < {thr:>4} nM: {n}/{len(d)} ({100*n/len(d):.0f}%)")
+    lf = d["log2_fold"].dropna().values
+    if len(lf) > 8:
+        # crude bimodality check: is the gap at the median larger than expected
+        mid = np.median(lf)
+        lo, hi = lf[lf <= mid], lf[lf > mid]
+        log(f"\n  log2 fold-change spread: {lf.min():.2f} to {lf.max():.2f}, "
+            f"median {mid:.2f}")
+        log(f"    lower half mean {lo.mean():.2f}, upper half mean {hi.mean():.2f}, "
+            f"separation {hi.mean()-lo.mean():.2f}")
+        log("    A continuous covariate avoids a threshold entirely; inspect the")
+        log("    histogram before imposing one.")
+
+
+def gene_expression_map(adata, p, genes):
+    """v4. Mean expression of each gene across ALL epithelial beads in the puck.
+    This is deliberately a GENE-level property, not a local one. Local expression
+    would be confounded: a region with high RNA capture shows more of everything
+    including TCR, so correlating local expression against local TCR signal
+    manufactures an association out of shared capture efficiency, which is the
+    same depth confounder that produced the false negative in Step08a."""
+    m = ((adata.obs["puck_id"].astype(str).values == f"Puck_211214_{p}") &
+         (adata.obs[ANNOT_COL].astype(str).values == EPITHELIAL))
+    if not m.sum():
+        return {}
+    present = [g for g in set(genes) if g in adata.var_names]
+    if not present:
+        return {}
+    sub = adata[m, present]
+    X = sub.X
+    X = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
+    return {g: float(np.asarray(X[:, i]).mean()) for i, g in enumerate(present)}
+
+
+def test_E_dose_response(ct, neo_info, adata, xy, pos, cases, R, p, chain, rows):
+    """v4. If the association is real it should SCALE with antigen strength.
+    v3 tested one usable covariate out of three: neoantigen burden was constant
+    (anchors sit 194-384 um apart, so almost none has a neighbour within 100 um)
+    and the strong/weak split never ran."""
     log(f"    TEST E  dose-response")
     c = ct[~ct.below_floor].set_index("anchor")
     if len(c) < 8:
         log(f"      only {len(c)} anchors above floor, too few"); return
+
+    genes = [neo_info.loc[a, "gene"] for a in c.index if a in neo_info.index]
+    expr = gene_expression_map(adata, p, genes)
+    log(f"      gene expression: {len(expr)}/{len(set(genes))} genes found in "
+        f"adata.var_names (puck-wide epithelial mean)")
 
     rec = []
     for a in c.index:
         if a not in neo_info.index:
             continue
         ic50 = float(neo_info.loc[a, "mut_ic50"])
-        strong = bool(neo_info.loc[a, "is_strong"])
-        # local neoantigen burden: how many OTHER anchors sit within R
-        burden = sum(1 for b in cases
-                     if b != a and b in pos and a in pos
-                     and np.hypot(*(xy[pos[b]] - xy[pos[a]])) <= R)
-        rec.append({"anchor": a, "top_frac": float(c.loc[a, "top_frac"]),
+        dl = float(neo_info.loc[a, "delta_ic50"])
+        g = neo_info.loc[a, "gene"]
+        rec.append({"anchor": a, "gene": g,
+                    "top_frac": float(c.loc[a, "top_frac"]),
                     "simpson": float(c.loc[a, "simpson"]),
                     "neg_log_ic50": -np.log10(max(ic50, 1e-3)),
-                    "is_strong": strong, "burden": burden})
+                    "log2_fold": float(np.log2((ic50 + dl) / max(ic50, 1e-3))),
+                    "expr": expr.get(g, np.nan)})
     if len(rec) < 8:
-        log("      too few anchors with affinity annotation"); return
+        log("      too few annotated anchors"); return
     d = pd.DataFrame(rec)
 
-    for xcol, lab in (("neg_log_ic50", "binding strength (-log10 IC50)"),
-                      ("burden", f"neoantigen burden within {R:.0f} um")):
-        if d[xcol].nunique() < 3:
-            log(f"      {lab}: too few distinct values"); continue
-        rho, pv = spearmanr(d[xcol].values, d["top_frac"].values)
-        rho_s, pv_s = spearmanr(d[xcol].values, d["simpson"].values)
-        log(f"      {lab}: n={len(d)}")
-        log(f"        vs top-clone fraction  rho {rho:+.3f}  p {pv:.4g}")
-        log(f"        vs Simpson             rho {rho_s:+.3f}  p {pv_s:.4g}")
-        rows.append({"test": f"E_dose_{xcol}", "puck": p, "radius": R,
-                     "chain": chain, "n": len(d), "rho": float(rho),
-                     "p": float(pv), "rho_simpson": float(rho_s),
-                     "p_simpson": float(pv_s)})
+    # composite: average of the available ranks, so no covariate needs a cutoff
+    ranks = []
+    for col in ("neg_log_ic50", "log2_fold", "expr"):
+        if d[col].notna().sum() >= 8:
+            ranks.append(d[col].rank(pct=True))
+    if ranks:
+        d["composite"] = pd.concat(ranks, axis=1).mean(axis=1)
 
-    ns, nw = int(d.is_strong.sum()), int((~d.is_strong).sum())
-    if ns >= 3 and nw >= 3:
-        try:
-            _, pv = mannwhitneyu(d.loc[d.is_strong, "top_frac"],
-                                 d.loc[~d.is_strong, "top_frac"],
-                                 alternative="greater")
-        except ValueError:
-            pv = np.nan
-        log(f"      strong binders (n={ns}) vs weak (n={nw}): "
-            f"median {d.loc[d.is_strong,'top_frac'].median():.4f} vs "
-            f"{d.loc[~d.is_strong,'top_frac'].median():.4f}, p {pv:.4g}")
-        rows.append({"test": "E_strong_vs_weak", "puck": p, "radius": R,
-                     "chain": chain, "n_strong": ns, "n_weak": nw, "p": float(pv)})
-    else:
-        log(f"      strong/weak split too uneven ({ns}/{nw}) to test")
+    for xcol, lab in (("neg_log_ic50", "binding strength (-log10 IC50)"),
+                      ("log2_fold", "binding gained vs wild type (log2 wt/mut)"),
+                      ("expr", "gene expression, puck-wide epithelial mean"),
+                      ("composite", "composite rank of the above")):
+        if xcol not in d.columns:
+            continue
+        sub = d[[xcol, "top_frac", "simpson"]].dropna()
+        if len(sub) < 8 or sub[xcol].nunique() < 4:
+            log(f"      {lab}: too few usable values (n={len(sub)})"); continue
+        rho, pv = spearmanr(sub[xcol].values, sub["top_frac"].values)
+        rs, ps = spearmanr(sub[xcol].values, sub["simpson"].values)
+        log(f"      {lab}: n={len(sub)}")
+        log(f"        vs top-clone fraction  rho {rho:+.3f}  p {pv:.4g}")
+        log(f"        vs Simpson             rho {rs:+.3f}  p {ps:.4g}")
+        rows.append({"test": f"E_dose_{xcol}", "puck": p, "radius": R,
+                     "chain": chain, "n": len(sub), "rho": float(rho),
+                     "p": float(pv), "rho_simpson": float(rs),
+                     "p_simpson": float(ps)})
+    log("      No threshold is applied anywhere: every covariate is continuous.")
 
 
 def power_test_A(ct, kt, pairs_p, p, R, rows, n_sim=2000):
@@ -789,6 +897,8 @@ def main():
             tot = tp.groupby("cloneId")["umi"].nunique()
             puck_freq = (tot / tot.sum()).to_dict()
             puck_umi = tot.to_dict()
+            global N_PUCK_CUR
+            N_PUCK_CUR = int(tot.sum())
             bead_clones = build_index(tp, set(idx))
             floor = FLOORS[p]
 
@@ -825,8 +935,8 @@ def main():
             rB = test_B(ct_B, pt_B, rows, p, R, args.chain, "top_frac",
                         "B_topclone")
             for k in K_VALUES:
-                rD = test_B(ct_B, pt_B, rows, p, R, args.chain, f"max_enr_k{k}",
-                            f"D_in_situ_k{k}", k=k)
+                rD = test_B(ct_B, pt_B, rows, p, R, args.chain, f"hyper_k{k}",
+                            f"D_hypergeom_k{k}", k=k)
                 if rD is None:
                     continue
                 for _, h in rD["res"][rD["res"].hit].iterrows():
@@ -844,7 +954,7 @@ def main():
                                  **wc})
 
             anchor_independence(tcases, xy, pos, R, p, rows)
-            test_E_dose_response(ct_B, info, xy, pos, tcases, R, p,
+            test_E_dose_response(ct_B, info, adata, xy, pos, tcases, R, p,
                                  args.chain, rows)
             if not args.skip_C:
                 test_C(adata, tp, tcases, p, R, args.chain, rows)
@@ -873,6 +983,21 @@ def main():
                 rows.append({"test": f"{test}_combined", "radius": R,
                              "chain": args.chain, "p": comb, "n_pucks": len(pv)})
 
+    comb = [r for r in rows if str(r.get("test", "")).endswith("_combined")]
+    if len(comb) > 1:
+        banner("MULTIPLICITY ACROSS THE COMBINED TABLE")
+        log("  The combined table is itself a family of tests. v3 reported 11")
+        log("  uncorrected rows and two of them landed near 0.02-0.03, which is")
+        log("  about what chance gives at that count.")
+        cp = np.array([r["p"] for r in comb], float)
+        ca = bh_adjust(cp)
+        for r, a in zip(comb, ca):
+            flag = "   <-- survives BH" if a < ALPHA else ""
+            log(f"    {r['test']:<32} p {r['p']:.4g}  BH {a:.4g}{flag}")
+            r["p_bh_family"] = float(a)
+        if not (ca < ALPHA).any():
+            log("  Nothing survives correction across the family.")
+
     if hits:
         hdf = pd.DataFrame(hits).sort_values("p_bh")
         hdf.to_csv(os.path.join(OUT, f"hits_{args.chain}.tsv"), sep="\t", index=False)
@@ -884,6 +1009,20 @@ def main():
             log(f"    clone {h.get('clone')} on {h.get('clone_beads')} beads, "
                 f"{h.get('clone_umis')} UMIs")
             log(f"    anchor {h.anchor}")
+        log("\n  ONE CELL OR EXPANSION?")
+        log("    Step08b measured the diffusion directly: a single T cell puts")
+        log("    UMIs on its own bead and on 0.018 neighbours per clone at 30 um.")
+        log("    So a few UMIs across 2 adjacent beads is what ONE cell looks")
+        log("    like. Expansion needs more beads, more UMIs, and spread beyond")
+        log("    one bead diameter.")
+        for _, h in hdf.iterrows():
+            nb = h.get("clone_beads", 0) or 0
+            nu = h.get("clone_umis_local", h.get("clone_umis", 0)) or 0
+            verdict = ("consistent with ONE cell plus diffusion"
+                       if (nb <= 2 or nu <= 6) else
+                       "beyond what one cell plus diffusion explains")
+            log(f"    {h.gene} {h.hgvs_p}: {nb} beads, {nu} local UMIs "
+                f"-> {verdict}")
         log("\n  CANDIDATES, not confirmed reactive pairs. Each needs its CDR3")
         log("  inspected and, ideally, orthogonal validation.")
     else:
